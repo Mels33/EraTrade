@@ -55,6 +55,11 @@ class FreshnessConfig(_Frozen):
     max_unknown_order_seconds: int = Field(gt=0)
 
 
+class ExecutionConfig(_Frozen):
+    stop_market_slippage_bps: Decimal = Field(gt=0, le=Decimal("2000"))
+    require_manual_confirmation: bool
+
+
 class StrategyConfig(_Frozen):
     spec_version: int
     market: MarketConfig
@@ -62,6 +67,7 @@ class StrategyConfig(_Frozen):
     sizing: SizingConfig
     limits: LimitsConfig
     freshness: FreshnessConfig
+    execution: ExecutionConfig
 
     @model_validator(mode="after")
     def _check_cross_fields(self) -> "StrategyConfig":

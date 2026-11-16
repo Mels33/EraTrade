@@ -123,3 +123,36 @@ class AgentInfo:
     address: str
     name: str
     valid_until: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveAssetData:
+    """Плечо и доступная для торговли маржа по инструменту (info activeAssetData).
+
+    available_to_trade учитывает spot USDC (единый баланс), в отличие от withdrawable
+    из clearinghouseState.
+    """
+
+    coin: str
+    leverage_type: str
+    leverage: int
+    max_trade_size_buy: Decimal
+    max_trade_size_sell: Decimal
+    available_to_trade_buy: Decimal
+    available_to_trade_sell: Decimal
+    mark_price: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class BestBidAsk:
+    bid: Decimal
+    ask: Decimal
+    time: datetime
+
+    @property
+    def mid(self) -> Decimal:
+        return (self.bid + self.ask) / 2
+
+    @property
+    def spread_bps(self) -> Decimal:
+        return (self.ask - self.bid) / self.mid * 10_000

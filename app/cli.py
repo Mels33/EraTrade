@@ -23,10 +23,14 @@ from app.config.strategy import load_strategy
 from app.db.models import AuditLogRecord
 from app.db.repositories import control
 from app.db.repositories import market as market_repo
+from app.db.repositories import trading as trading_repo
 from app.db.repositories.market import upsert_market
 from app.db.session import create_engine, create_sessionmaker
+from app.domain.account import Side
 from app.domain.control import Actor, ActorKind, TransitionError
 from app.domain.instruments import InstrumentRules, Rounding
+from app.domain.orders import OrderStatus
+from app.execution.engine import ExecutionEngine, OrderPreview, TradeResult
 from app.execution.session import TradingSession, open_trading_session
 from app.integrations.hyperliquid import actions as hl_actions
 from app.integrations.hyperliquid.gateway import INTERVALS, HyperliquidGateway, open_gateway
@@ -497,6 +501,151 @@ def verify_signing(
     )
     if not ok:
         raise typer.Exit(code=1)
+
+
+async def _with_engine[T](settings: Settings, fn: Callable[[ExecutionEngine], Awaitable[T]]) -> T:
+    strategy = load_strategy(settings.strategy_config_path)
+
+    async def _run(session: TradingSession, gw: HyperliquidGateway) -> T:
+        engine = await ExecutionEngine.create(
+            session, gw, create_sessionmaker(create_engine(settings)), strategy
+        )
+        with correlation_scope():
+            return await fn(engine)
+
+    return await _with_trading_session(settings, _run)
+
+
+def _make_confirm(settings: Settings) -> Callable[[OrderPreview], Awaitable[bool]]:
+    async def confirm(p: OrderPreview) -> bool:
+        if settings.is_mainnet:
+            typer.secho("MAINNET — реальные деньги", fg=typer.colors.RED, bold=True)
+        spread = f"{p.spread_bps:.2f} bps" if p.spread_bps is not None else "нет данных"
+        typer.echo(
+            f"{p.purpose.value.upper()} {p.side.value.upper()} {p.size} @ лимит {p.limit_price} "
+            f"(≈{p.notional:.2f} USDC), mid {p.mid_price}, спред {spread}"
+        )
+        typer.echo(
+            f"позиция сейчас {p.position_size}, плечо isolated {p.leverage_target}x, "
+            f"доступно {p.available_to_trade:.2f} USDC"
+        )
+        if p.stop_trigger is not None:
+            typer.echo(
+                f"stop-market reduceOnly: срабатывание {p.stop_trigger}, "
+                f"убыток до стопа ≈ {p.max_loss_at_stop:.2f} USDC (без проскальзывания)"
+            )
+        return typer.confirm("Отправить ордер?", default=False)
+
+    return confirm
+
+
+def _print_trade(result: TradeResult) -> None:
+    for label, order in (("ордер", result.order), ("stop", result.stop)):
+        if order is None:
+            continue
+        color = {
+            OrderStatus.FILLED: typer.colors.GREEN,
+            OrderStatus.RESTING: typer.colors.GREEN,
+            OrderStatus.PARTIALLY_FILLED: typer.colors.YELLOW,
+            OrderStatus.UNKNOWN: typer.colors.YELLOW,
+        }.get(order.status, typer.colors.RED)
+        typer.secho(
+            f"{label}: {order.status.value} исполнено {order.filled_size} "
+            f"@ {order.avg_price or '—'}  cloid={order.cloid}",
+            fg=color,
+        )
+        for reason in order.guard_reasons:
+            typer.echo(f"  отклонено: {reason}")
+        if order.error and not order.guard_reasons:
+            typer.echo(f"  ошибка: {order.error}")
+    for warning in result.warnings:
+        typer.secho(warning, fg=typer.colors.RED, bold=True)
+
+
+@app.command("open")
+def open_position(
+    direction: str = typer.Argument(..., help="long или short"),
+    notional: Decimal = typer.Option(..., help="Номинал в USDC (лимит — в config/strategy.toml)"),
+    stop_price: Decimal | None = typer.Option(None, help="Цена стопа (по умолчанию из ATR)"),
+) -> None:
+    """Открыть позицию IOC-ордером и поставить биржевой stop-market (с подтверждением)."""
+    if direction not in ("long", "short"):
+        raise typer.BadParameter("direction: long или short")
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+    side = Side.BUY if direction == "long" else Side.SELL
+
+    async def _open(engine: ExecutionEngine) -> TradeResult:
+        return await engine.open_position(
+            side, notional, confirm=_make_confirm(settings), stop_price=stop_price
+        )
+
+    _print_trade(asyncio.run(_with_engine(settings, _open)))
+
+
+@app.command("close")
+def close_position() -> None:
+    """Закрыть позицию reduceOnly IOC-ордером, снять или пересоздать stop (с подтверждением)."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+
+    async def _close(engine: ExecutionEngine) -> TradeResult:
+        return await engine.close_position(confirm=_make_confirm(settings))
+
+    _print_trade(asyncio.run(_with_engine(settings, _close)))
+
+
+@app.command("cancel")
+def cancel_order(cloid: str = typer.Argument(..., help="cloid ордера")) -> None:
+    """Отменить ордер по cloid."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+
+    async def _cancel(engine: ExecutionEngine) -> TradeResult:
+        async with engine.sm() as db:
+            order = await trading_repo.get_order_by_cloid(db, cloid)
+        if order is None:
+            raise typer.BadParameter(f"ордер {cloid} не найден в БД")
+        return TradeResult(await engine.cancel(order.id))
+
+    _print_trade(asyncio.run(_with_engine(settings, _cancel)))
+
+
+@app.command("resolve")
+def resolve_orders(
+    hours: int = typer.Option(24, help="За сколько часов синхронизировать исполнения"),
+) -> None:
+    """Сверить незавершённые ордера с биржей по cloid и сохранить исполнения."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+
+    async def _resolve(engine: ExecutionEngine) -> tuple[list[TradeResult], int]:
+        results = [TradeResult(r) for r in await engine.resolve_unresolved()]
+        new_fills = await engine.sync_fills(datetime.now(UTC) - timedelta(hours=hours))
+        await engine.snapshot()
+        return results, new_fills
+
+    results, new_fills = asyncio.run(_with_engine(settings, _resolve))
+    for result in results:
+        _print_trade(result)
+    typer.echo(f"Незавершённых ордеров проверено: {len(results)}, новых исполнений: {new_fills}")
+
+
+@app.command("orders")
+def list_orders_cmd(limit: int = typer.Option(20, help="Сколько последних ордеров")) -> None:
+    """Последние ордера из БД."""
+    settings = _load_settings()
+
+    async def _list(session: AsyncSession) -> None:
+        for o in await trading_repo.list_orders(session, limit=limit):
+            trigger = f" trig {o.trigger_price}" if o.trigger_price else ""
+            typer.echo(
+                f"{o.created_at:%m-%d %H:%M:%S} {o.purpose:<5} {o.side:<4} {o.size} @ {o.price}"
+                f"{trigger} {o.status:<16} filled {o.filled_size} {o.cloid}"
+                + (f"  ({o.error[:60]})" if o.error else "")
+            )
+
+    _run_in_transaction(settings, _list)
 
 
 if __name__ == "__main__":

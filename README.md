@@ -52,6 +52,20 @@ ERATRADE_ENV_FILE=.env.mainnet,.env.mainnet.secrets uv run eratrade wallet-check
 ERATRADE_ENV_FILE=.env.mainnet,.env.mainnet.secrets uv run eratrade verify-signing   # no-op отмена
 ```
 
+Ручная торговля (этап 6; каждый ордер подтверждается в терминале):
+
+```bash
+E=".env.mainnet,.env.mainnet.secrets"
+ERATRADE_ENV_FILE=$E uv run eratrade open long --notional 12   # IOC-вход + биржевой stop-market
+ERATRADE_ENV_FILE=$E uv run eratrade close                     # reduceOnly-закрытие, снятие стопа
+ERATRADE_ENV_FILE=$E uv run eratrade cancel <cloid>
+ERATRADE_ENV_FILE=$E uv run eratrade resolve                   # сверка незавершённых ордеров по cloid
+ERATRADE_ENV_FILE=.env.mainnet uv run eratrade orders
+```
+
+Новые входы разрешены только в режиме `LIVE_ENABLED` (включается `set-mode` из `LIVE_PAUSED`
+с подтверждением); закрытие и стопы — также в `LIVE_PAUSED`.
+
 Защита торгового процесса (этап 5):
 - подписываются только `order`, `cancel`, `cancelByCloid`, `updateLeverage`, `scheduleCancel` —
   вывод средств и переводы невозможны даже при ошибке в коде;

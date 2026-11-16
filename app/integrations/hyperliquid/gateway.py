@@ -13,7 +13,9 @@ from decimal import Decimal
 from app.config.settings import Network, Settings
 from app.domain.account import (
     AccountState,
+    ActiveAssetData,
     AgentInfo,
+    BestBidAsk,
     Fill,
     OpenOrder,
     OrderStatusResult,
@@ -179,6 +181,15 @@ class HyperliquidGateway:
     async def get_user_rate_limit(self, user: str) -> RateLimitStatus:
         data = await self._client.post({"type": "userRateLimit", "user": normalize_address(user)})
         return parsing.parse_user_rate_limit(data)
+
+    async def get_active_asset_data(self, user: str, coin: str) -> ActiveAssetData:
+        data = await self._client.post(
+            {"type": "activeAssetData", "user": normalize_address(user), "coin": coin}
+        )
+        return parsing.parse_active_asset_data(data)
+
+    async def get_best_bid_ask(self, coin: str) -> BestBidAsk:
+        return parsing.parse_best_bid_ask(await self._client.post({"type": "l2Book", "coin": coin}))
 
     async def get_user_role(self, address: str) -> UserRole:
         data = await self._client.post({"type": "userRole", "user": normalize_address(address)})

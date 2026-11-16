@@ -41,7 +41,9 @@
 |---|---|
 | Вход | IOC limit с ценой не хуже `mid ± max_slippage` |
 | Выход | IOC limit, `reduceOnly` |
-| Защита | биржевой trigger stop-loss, `reduceOnly` |
+| Защита | биржевой trigger stop-market, `reduceOnly`; лимит на 5% хуже цены срабатывания |
+
+На этапах 6–8 каждый ордер подтверждается оператором вручную (`require_manual_confirmation`).
 
 ## 4. Размер позиции
 

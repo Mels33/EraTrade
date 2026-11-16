@@ -38,3 +38,9 @@ max_slippage_bps = "10"
 max_decision_delay_seconds = 90
 max_ws_silence_seconds = 30
 max_unknown_order_seconds = 30
+
+[execution]
+# Лимит stop-market ордера: на столько хуже цены срабатывания (худшая допустимая цена исполнения).
+stop_market_slippage_bps = "500"
+# Каждый ордер подтверждается оператором вручную (этапы 6–8, решение без testnet).
+require_manual_confirmation = true

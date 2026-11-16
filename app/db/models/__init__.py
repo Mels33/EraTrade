@@ -10,13 +10,25 @@ from app.db.models.control import (
     NonceStateRecord,
 )
 from app.db.models.market import CandleRecord, MarketContextSnapshotRecord, MarketRecord
+from app.db.models.trading import (
+    AccountSnapshotRecord,
+    FillRecord,
+    OrderEventRecord,
+    OrderRecord,
+    PositionSnapshotRecord,
+)
 
 __all__ = [
+    "AccountSnapshotRecord",
     "AuditLogRecord",
     "BotStateRecord",
     "CandleRecord",
+    "FillRecord",
     "HeartbeatRecord",
     "MarketContextSnapshotRecord",
     "MarketRecord",
     "NonceStateRecord",
+    "OrderEventRecord",
+    "OrderRecord",
+    "PositionSnapshotRecord",
 ]

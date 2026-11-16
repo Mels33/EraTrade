@@ -98,7 +98,8 @@ async def committing_sessionmaker(
     (audit_log не трогается — его очистка запрещена триггером)."""
     engine = create_async_engine(migrated_db, poolclass=NullPool)
     truncate = text(
-        "TRUNCATE candles, market_context_snapshots, heartbeats, markets, nonce_state CASCADE"
+        "TRUNCATE candles, market_context_snapshots, heartbeats, markets, nonce_state, "
+        "bot_state, account_snapshots CASCADE"
     )
     async with engine.begin() as conn:
         await conn.execute(truncate)

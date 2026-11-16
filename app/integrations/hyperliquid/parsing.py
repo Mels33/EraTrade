@@ -13,7 +13,9 @@ from typing import Any
 from app.config.settings import Network
 from app.domain.account import (
     AccountState,
+    ActiveAssetData,
     AgentInfo,
+    BestBidAsk,
     Fill,
     OpenOrder,
     OrderStatusResult,
@@ -456,3 +458,42 @@ def parse_extra_agents(data: Any) -> list[AgentInfo]:
             )
         )
     return agents
+
+
+def _pair(obj: Mapping[str, Any], key: str, what: str) -> tuple[Decimal, Decimal]:
+    values = _list(_get(obj, key, what), f"{what}.{key}")
+    if len(values) != 2:
+        raise HyperliquidFormatError(f"{what}.{key}: ожидалось [buy, sell]")
+    return _to_decimal(values[0], f"{what}.{key}[0]"), _to_decimal(values[1], f"{what}.{key}[1]")
+
+
+def parse_active_asset_data(data: Any) -> ActiveAssetData:
+    d = _obj(data, "activeAssetData")
+    leverage = _obj(_get(d, "leverage", "activeAssetData"), "activeAssetData.leverage")
+    max_buy, max_sell = _pair(d, "maxTradeSzs", "activeAssetData")
+    avail_buy, avail_sell = _pair(d, "availableToTrade", "activeAssetData")
+    return ActiveAssetData(
+        coin=_str(d, "coin", "activeAssetData"),
+        leverage_type=_str(leverage, "type", "activeAssetData.leverage"),
+        leverage=_int(leverage, "value", "activeAssetData.leverage"),
+        max_trade_size_buy=max_buy,
+        max_trade_size_sell=max_sell,
+        available_to_trade_buy=avail_buy,
+        available_to_trade_sell=avail_sell,
+        mark_price=_dec(d, "markPx", "activeAssetData"),
+    )
+
+
+def parse_best_bid_ask(data: Any) -> BestBidAsk:
+    book = _obj(data, "l2Book")
+    levels = _list(_get(book, "levels", "l2Book"), "l2Book.levels")
+    if len(levels) != 2:
+        raise HyperliquidFormatError("l2Book.levels: ожидалось [bids, asks]")
+    bids, asks = _list(levels[0], "l2Book.bids"), _list(levels[1], "l2Book.asks")
+    if not bids or not asks:
+        raise HyperliquidFormatError("l2Book: пустая сторона стакана")
+    bid = _dec(_obj(bids[0], "l2Book.bid"), "px", "l2Book.bid")
+    ask = _dec(_obj(asks[0], "l2Book.ask"), "px", "l2Book.ask")
+    if bid >= ask:
+        raise HyperliquidFormatError(f"l2Book: bid {bid} >= ask {ask}")
+    return BestBidAsk(bid=bid, ask=ask, time=_time(book, "time", "l2Book"))

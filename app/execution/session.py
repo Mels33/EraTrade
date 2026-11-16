@@ -43,11 +43,18 @@ class TradingSession:
     wallet: WalletStatus
     clock_skew: timedelta
 
-    async def submit(self, action: dict[str, Any]) -> ExchangeResponse:
+    async def prepare(self, action: dict[str, Any]) -> dict[str, Any]:
+        """Проверка блокировки → новый nonce → подпись. Возвращает payload, ещё не отправленный:
+        вызывающий успевает сохранить nonce и действие до отправки."""
         await self.lock.ensure_held()
         nonce = await self.nonces.next()
-        payload = self.signer.sign(action, nonce, self.wallet.vault_address)
+        return self.signer.sign(action, nonce, self.wallet.vault_address)
+
+    async def send(self, payload: dict[str, Any]) -> ExchangeResponse:
         return await self.exchange.post(payload)
+
+    async def submit(self, action: dict[str, Any]) -> ExchangeResponse:
+        return await self.send(await self.prepare(action))
 
 
 @asynccontextmanager
