@@ -1,0 +1,53 @@
+[
+ {
+  "coin": "COMP",
+  "px": "17.774",
+  "sz": "0.94",
+  "side": "B",
+  "time": 1794863381297,
+  "startPosition": "-262.2",
+  "dir": "Close Short",
+  "closedPnl": "0.144666",
+  "hash": "0x13bf054fde84b8f615380448f219520201e600357987d7c8b787b0a29d8892e0",
+  "oid": 607459801275,
+  "crossed": true,
+  "fee": "0.002405",
+  "tid": 676093254779938,
+  "feeToken": "USDC",
+  "twapId": null
+ },
+ {
+  "coin": "HBAR",
+  "px": "0.05748",
+  "sz": "305.0",
+  "side": "B",
+  "time": 1794863382573,
+  "startPosition": "458079.0",
+  "dir": "Open Long",
+  "closedPnl": "0.0",
+  "hash": "0xc1c37c6e52e82861c33d0448f2196502017d0053edeb4733658c27c111ec024c",
+  "oid": 607459808782,
+  "crossed": true,
+  "fee": "0.002524",
+  "tid": 380133382693175,
+  "feeToken": "USDC",
+  "twapId": null
+ },
+ {
+  "coin": "GALA",
+  "px": "0.001377",
+  "sz": "22437.0",
+  "side": "B",
+  "time": 1794863382845,
+  "startPosition": "-23696760.0",
+  "dir": "Close Short",
+  "closedPnl": "0.695547",
+  "hash": "0x03b0a06d31a84213052a0448f219690203350052ccab60e5a7794bbff0ac1bfd",
+  "oid": 607459810977,
+  "crossed": true,
+  "fee": "0.004448",
+  "tid": 160271426426301,
+  "feeToken": "USDC",
+  "twapId": null
+ }
+]

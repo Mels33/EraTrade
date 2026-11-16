@@ -32,7 +32,7 @@ def candle(index: int = 0, **overrides: Any) -> Candle:
     values: dict[str, Any] = {
         "interval": "1h",
         "open_time": open_time,
-        "close_time": open_time + HOUR - timedelta(milliseconds=1),
+        "close_time": open_time + HOUR,  # конец интервала (исключительно)
         "open": Decimal("90000"),
         "high": Decimal("90500.5"),
         "low": Decimal("89800"),

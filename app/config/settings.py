@@ -7,16 +7,18 @@ URL Hyperliquid не настраивается вручную, а выводи�
 """
 
 import os
+import re
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import SecretStr, ValidationError, model_validator
+from pydantic import SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 
 MAINNET_CONFIRMATION_PHRASE = "I_UNDERSTAND_REAL_MONEY"
+_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
 class Network(StrEnum):
@@ -77,6 +79,15 @@ class Settings(BaseSettings):
     log_level: str = "info"
 
     strategy_config_path: Path = Path("config/strategy.toml")
+
+    @field_validator("hl_account_address", mode="before")
+    @classmethod
+    def _check_address(cls, value: object) -> object:
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str) or not _ADDRESS_RE.match(value):
+            raise ValueError("HL_ACCOUNT_ADDRESS должен иметь вид 0x + 40 hex-символов")
+        return value.lower()
 
     @model_validator(mode="after")
     def _check_consistency(self) -> "Settings":

@@ -1,0 +1,25 @@
+{
+ "status": "order",
+ "order": {
+  "order": {
+   "coin": "BRETT",
+   "side": "B",
+   "limitPx": "0.003392",
+   "sz": "191521.0",
+   "oid": 607464776236,
+   "timestamp": 1794863981462,
+   "triggerCondition": "N/A",
+   "isTrigger": false,
+   "triggerPx": "0.0",
+   "children": [],
+   "isPositionTpsl": false,
+   "reduceOnly": false,
+   "orderType": "Limit",
+   "origSz": "191521.0",
+   "tif": "Alo",
+   "cloid": null
+  },
+  "status": "open",
+  "statusTimestamp": 1794863981462
+ }
+}

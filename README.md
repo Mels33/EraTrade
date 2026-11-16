@@ -18,6 +18,8 @@ uv run alembic upgrade head
 ```bash
 uv run eratrade status                          # режим, запрет входов, heartbeat, аудит
 uv run eratrade set-mode TESTNET -r "причина"   # смена режима, пишется в аудит
+uv run eratrade market                          # meta, funding/OI, свечи; meta сохраняется в БД
+uv run eratrade account                         # нужен HL_ACCOUNT_ADDRESS в .env
 ```
 
 ## Проверки
@@ -25,6 +27,7 @@ uv run eratrade set-mode TESTNET -r "причина"   # смена режима
 ```bash
 uv run pytest          # БД-тесты используют eratrade_pytest_testnet и пропускаются без PostgreSQL
 uv run alembic check   # модели и миграции совпадают
+ERATRADE_LIVE_TESTS=1 uv run pytest tests/live   # формат ответов живого testnet API
 uv run ruff check .
 uv run mypy
 ```

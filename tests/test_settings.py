@@ -135,3 +135,15 @@ def test_get_settings_error_hides_input(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert "не совпадает" in message
     assert FAKE_KEY not in message
     assert "db-pass-123" not in message
+
+
+def test_account_address_normalized() -> None:
+    assert make(hl_account_address="").hl_account_address is None
+    addr = "0x" + "AB" * 20
+    assert make(hl_account_address=addr).hl_account_address == addr.lower()
+
+
+@pytest.mark.parametrize("bad", ["0x123", "ab" * 20, "0x" + "zz" * 20])
+def test_invalid_account_address_rejected(bad: str) -> None:
+    with pytest.raises(ValidationError, match="HL_ACCOUNT_ADDRESS"):
+        make(hl_account_address=bad)
