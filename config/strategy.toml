@@ -1,0 +1,40 @@
+# Торговая и риск-спецификация EraTrade. Описание: docs/spec.md
+# Денежные и дробные значения записаны строками, чтобы читаться как Decimal без потерь.
+
+spec_version = 1
+
+[market]
+coin = "BTC"
+interval = "1h"
+horizon_candles = 4
+margin_mode = "isolated"
+leverage = 2
+
+[policy]
+allow_long = true
+allow_short = true
+allow_reversal = false
+time_exit_candles = 8
+reentry_cooldown_candles = 1
+
+[sizing]
+fixed_risk_usdc = "10"
+risk_fraction = "0.005"          # 0.5% equity
+stop_atr_period = 14
+stop_atr_multiplier = "1.5"
+min_stop_distance_fraction = "0.005"  # 0.5% цены
+min_order_notional_usdc = "10"
+
+[limits]
+max_position_notional_usdc = "200"
+max_leverage = 2
+max_daily_loss_fraction = "0.02"   # 2% equity
+max_weekly_loss_fraction = "0.05"  # 5% equity
+max_trades_per_day = 4
+max_spread_bps = "5"
+max_slippage_bps = "10"
+
+[freshness]
+max_decision_delay_seconds = 90
+max_ws_silence_seconds = 30
+max_unknown_order_seconds = 30

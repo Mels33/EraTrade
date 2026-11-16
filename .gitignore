@@ -1,0 +1,21 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Секреты и окружения
+.env
+.env.*
+!.env.example.*
+
+# Данные
+backups/
+artifacts/
+*.cbm
+
+# IDE
+.idea/
+.logfire/

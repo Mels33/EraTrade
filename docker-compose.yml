@@ -1,0 +1,24 @@
+# Локальное окружение EraTrade: только PostgreSQL.
+# Порт 5435, чтобы не конфликтовать с другими локальными Postgres.
+services:
+  postgres:
+    image: postgres:17
+    container_name: eratrade-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: eratrade
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-eratrade_local}
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5435:5432"
+    volumes:
+      - eratrade_pg_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eratrade -d eratrade_testnet"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  eratrade_pg_data:
