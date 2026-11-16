@@ -130,3 +130,28 @@ async def test_context_snapshots(session: AsyncSession) -> None:
     assert latest is not None
     assert latest.funding == Decimal("-0.00001")
     assert latest.exchange_time is None
+
+
+async def test_find_missing_candles(session: AsyncSession) -> None:
+    market_id = await repo.upsert_market(session, market_meta())
+    await repo.upsert_candles(
+        session,
+        market_id,
+        [candle(0), candle(1), candle(3), candle(4, is_closed=False)],
+    )
+    missing = await repo.find_missing_candles(session, market_id, "1h", HOUR, T0, T0 + 5 * HOUR)
+    # 2 отсутствует, 4 есть, но не закрыта — тоже считается пропуском закрытых данных.
+    assert missing == [T0 + 2 * HOUR, T0 + 4 * HOUR]
+    assert await repo.find_missing_candles(session, market_id, "1h", HOUR, T0, T0) == []
+
+    count, first, last = await repo.candle_stats(session, market_id, "1h")
+    assert (count, first, last) == (3, T0, T0 + 3 * HOUR)
+
+
+async def test_full_backfill_size_is_batched(session: AsyncSession) -> None:
+    # 5000 свечей × 14 параметров больше предела PostgreSQL в 32767 — нужна запись пачками.
+    market_id = await repo.upsert_market(session, market_meta())
+    batch = [candle(i) for i in range(5000)]
+    assert await repo.upsert_candles(session, market_id, batch) == 5000
+    count, _, _ = await repo.candle_stats(session, market_id, "1h")
+    assert count == 5000

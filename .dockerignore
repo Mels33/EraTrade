@@ -1,0 +1,16 @@
+.venv
+.git
+.idea
+.env
+.env.*
+backups
+tests
+docs
+docker
+scripts
+**/__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+*.md
+!README.md

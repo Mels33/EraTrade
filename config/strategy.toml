@@ -26,7 +26,7 @@ min_stop_distance_fraction = "0.005"  # 0.5% цены
 min_order_notional_usdc = "10"
 
 [limits]
-max_position_notional_usdc = "200"
+max_position_notional_usdc = "20"  # технические тесты на mainnet; 200 — после этапа 14
 max_leverage = 2
 max_daily_loss_fraction = "0.02"   # 2% equity
 max_weekly_loss_fraction = "0.05"  # 5% equity

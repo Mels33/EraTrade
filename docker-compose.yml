@@ -20,5 +20,43 @@ services:
       timeout: 3s
       retries: 20
 
+  # Коллектор рыночных данных mainnet: только чтение публичных данных, режим DISABLED, без ключей.
+  # Запуск: docker-compose --profile collector up -d --build
+  collector-mainnet:
+    build: .
+    container_name: eratrade-collector-mainnet
+    profiles: ["collector"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env.mainnet
+    environment:
+      DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
+      ERATRADE_ENV_FILE: /nonexistent
+    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade collect"]
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
+  # Ежедневные бэкапы обеих БД в ./backups (хранение 14 дней).
+  pg-backup:
+    image: postgres:17
+    container_name: eratrade-pg-backup
+    profiles: ["collector"]
+    restart: unless-stopped
+    user: "1000:1000"  # файлы бэкапов принадлежат пользователю, а не root
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-eratrade_local}
+      BACKUP_RETENTION_DAYS: "14"
+    volumes:
+      - ./backups:/backups
+      - ./docker/backup/backup-loop.sh:/backup-loop.sh:ro
+    entrypoint: ["/backup-loop.sh"]
+
 volumes:
   eratrade_pg_data:

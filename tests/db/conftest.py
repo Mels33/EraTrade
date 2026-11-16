@@ -14,8 +14,9 @@ import asyncpg
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.config.settings import get_settings
@@ -86,3 +87,22 @@ async def session(migrated_db: str) -> AsyncIterator[AsyncSession]:
             await s.close()
             await trans.rollback()
     await engine.dispose()
+
+
+@pytest.fixture
+async def committing_sessionmaker(
+    migrated_db: str,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Для кода, который сам управляет транзакциями и работает из нескольких задач.
+    Данные реально коммитятся; рыночные таблицы очищаются до и после теста
+    (audit_log не трогается — его очистка запрещена триггером)."""
+    engine = create_async_engine(migrated_db, poolclass=NullPool)
+    truncate = text("TRUNCATE candles, market_context_snapshots, heartbeats, markets CASCADE")
+    async with engine.begin() as conn:
+        await conn.execute(truncate)
+    try:
+        yield async_sessionmaker(engine, expire_on_commit=False)
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(truncate)
+        await engine.dispose()

@@ -25,7 +25,7 @@ def test_repository_config_matches_spec() -> None:
     assert s.policy.time_exit_candles == 8
     assert s.sizing.fixed_risk_usdc == Decimal("10")
     assert s.sizing.risk_fraction == Decimal("0.005")
-    assert s.limits.max_position_notional_usdc == Decimal("200")
+    assert s.limits.max_position_notional_usdc == Decimal("20")
     assert s.limits.max_daily_loss_fraction == Decimal("0.02")
     assert s.limits.max_trades_per_day == 4
     assert s.freshness.max_ws_silence_seconds == 30

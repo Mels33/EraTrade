@@ -3,6 +3,7 @@
 import asyncio
 import getpass
 import json
+import signal
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -21,11 +22,16 @@ from app.config.settings import (
 from app.config.strategy import load_strategy
 from app.db.models import AuditLogRecord
 from app.db.repositories import control
+from app.db.repositories import market as market_repo
 from app.db.repositories.market import upsert_market
 from app.db.session import create_engine, create_sessionmaker
 from app.domain.control import Actor, ActorKind, TransitionError
 from app.domain.instruments import InstrumentRules, Rounding
-from app.integrations.hyperliquid.gateway import open_gateway
+from app.integrations.hyperliquid.gateway import INTERVALS, open_gateway
+from app.market_data.collector import COMPONENT as COLLECTOR
+from app.market_data.collector import CollectorConfig, MarketDataCollector, floor_time
+from app.market_data.gaps import compress_ranges
+from app.market_data.metadata import sync_market
 from app.observability.logging import configure_logging, correlation_scope
 
 # show_locals=False: локальные переменные (настройки, ключи) не печатаются в трейсбеке.
@@ -265,6 +271,145 @@ def account() -> None:
         )
 
     asyncio.run(_fetch())
+
+
+@app.command("collect")
+def collect() -> None:
+    """Запустить коллектор данных (свечи + funding/OI). Работает до остановки (Ctrl+C / SIGTERM)."""
+    settings = _load_settings()
+    configure_logging(settings, service="collector")
+    strategy = load_strategy(settings.strategy_config_path)
+    config = CollectorConfig(
+        coin=strategy.market.coin,
+        interval=strategy.market.interval,
+        max_ws_silence=float(strategy.freshness.max_ws_silence_seconds),
+    )
+
+    async def _run() -> None:
+        task = asyncio.current_task()
+        loop = asyncio.get_running_loop()
+        if task is not None:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, task.cancel)
+        engine = create_engine(settings)
+        try:
+            async with open_gateway(settings) as gw:
+                collector = MarketDataCollector(
+                    gw, create_sessionmaker(engine), settings.hyperliquid_ws_url, config
+                )
+                await collector.run()
+        finally:
+            await engine.dispose()
+
+    typer.secho(
+        f"Коллектор {settings.network.value.upper()} {config.coin} {config.interval}", bold=True
+    )
+    try:
+        asyncio.run(_run())
+    except asyncio.CancelledError:
+        typer.echo("Коллектор остановлен")
+
+
+@app.command("backfill")
+def backfill(
+    hours: int = typer.Option(
+        ..., help="Сколько часов истории загрузить (биржа хранит ~5000 свечей)"
+    ),
+) -> None:
+    """Догрузить окно свечей через REST (идемпотентно; закрытые свечи не перезаписываются)."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+    strategy = load_strategy(settings.strategy_config_path)
+    coin, interval = strategy.market.coin, strategy.market.interval
+
+    async def _run() -> tuple[int, int]:
+        engine = create_engine(settings)
+        try:
+            async with open_gateway(settings) as gw:
+                start = datetime.now(UTC) - timedelta(hours=hours)
+                candles = await gw.get_candles(coin, interval, start=start)
+                async with create_sessionmaker(engine).begin() as session:
+                    market_id, _, _ = await sync_market(gw, session, coin)
+                    written = await market_repo.upsert_candles(session, market_id, candles)
+                return len(candles), written
+        finally:
+            await engine.dispose()
+
+    received, written = asyncio.run(_run())
+    typer.echo(f"Получено свечей: {received}, записано/обновлено: {written}")
+
+
+@app.command("data-status")
+def data_status(
+    days: int = typer.Option(30, help="За сколько дней искать пропуски"),
+) -> None:
+    """Сколько данных накоплено, пропуски, свежесть контекста и heartbeat коллектора."""
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin, interval = strategy.market.coin, strategy.market.interval
+    step = INTERVALS[interval]
+
+    async def _status(session: AsyncSession) -> None:
+        now = datetime.now(UTC)
+        record = await market_repo.get_market(session, settings.network, coin)
+        typer.secho(f"{settings.network.value.upper()} · {coin} {interval}", bold=True)
+        if record is None:
+            typer.echo("Рынка нет в БД — запустите `eratrade collect` или `eratrade market`.")
+            return
+        count, first, last = await market_repo.candle_stats(session, record.id, interval)
+        typer.echo(
+            f"Закрытых свечей: {count}"
+            + (f"  ({first:%Y-%m-%d %H:%M} … {last:%Y-%m-%d %H:%M} UTC)" if first and last else "")
+        )
+        if last is not None:
+            lag = now - (last + step)
+            typer.echo(
+                f"Последняя закрытая свеча закончилась {lag.total_seconds() / 60:.1f} мин назад"
+            )
+
+        window_start = floor_time(max(first or now, now - timedelta(days=days)), step)
+        missing = await market_repo.find_missing_candles(
+            session,
+            record.id,
+            interval,
+            step,
+            window_start,
+            (last + step) if last else window_start,
+        )
+        if missing:
+            typer.secho(f"Пропуски за {days} дн.: {len(missing)} свечей", fg=typer.colors.RED)
+            for a, b in compress_ranges(missing, step)[:10]:
+                typer.echo(f"  {a:%Y-%m-%d %H:%M} … {b:%Y-%m-%d %H:%M}")
+        else:
+            typer.secho(f"Пропусков за {days} дн. нет", fg=typer.colors.GREEN)
+
+        ctx = await market_repo.get_latest_context(session, record.id)
+        if ctx is None:
+            typer.echo("Снимков funding/OI нет")
+        else:
+            age = (now - ctx.received_at).total_seconds()
+            typer.echo(
+                f"Последний снимок контекста: {age:.0f} с назад ({ctx.source}), "
+                f"funding={ctx.funding}, OI={ctx.open_interest}"
+            )
+
+        heartbeat = next(
+            (hb for hb in await control.get_heartbeats(session) if hb.component == COLLECTOR), None
+        )
+        if heartbeat is None:
+            typer.secho("Коллектор ни разу не запускался", fg=typer.colors.YELLOW)
+        else:
+            age = (now - heartbeat.last_beat_at).total_seconds()
+            alive = age < 60
+            typer.secho(
+                f"Коллектор: heartbeat {age:.0f} с назад, WS={heartbeat.details.get('ws_state')}, "
+                f"переподключений={heartbeat.details.get('reconnects')}",
+                fg=typer.colors.GREEN if alive else typer.colors.RED,
+            )
+            if heartbeat.details.get("last_error"):
+                typer.echo(f"  последняя ошибка: {heartbeat.details['last_error']}")
+
+    _run_in_transaction(settings, _status)
 
 
 if __name__ == "__main__":

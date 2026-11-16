@@ -147,3 +147,29 @@ def test_account_address_normalized() -> None:
 def test_invalid_account_address_rejected(bad: str) -> None:
     with pytest.raises(ValidationError, match="HL_ACCOUNT_ADDRESS"):
         make(hl_account_address=bad)
+
+
+def test_multiple_env_files_secrets_separate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    common = tmp_path / ".env.common"
+    common.write_text(
+        f"ENVIRONMENT=testnet\nHYPERLIQUID_NETWORK=testnet\nDATABASE_URL={TESTNET_DB}\n"
+    )
+    secrets = tmp_path / ".env.secrets"
+    secrets.write_text(f"HL_API_WALLET_PRIVATE_KEY={FAKE_KEY}\n")
+    for var in ("ENVIRONMENT", "HYPERLIQUID_NETWORK", "DATABASE_URL", "HL_API_WALLET_PRIVATE_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+    monkeypatch.setenv("ERATRADE_ENV_FILE", f"{common}, {secrets}")
+    get_settings.cache_clear()
+    try:
+        with_key = get_settings()
+        monkeypatch.setenv("ERATRADE_ENV_FILE", str(common))
+        get_settings.cache_clear()
+        without_key = get_settings()
+    finally:
+        get_settings.cache_clear()
+    assert with_key.hl_api_wallet_private_key is not None
+    assert with_key.hl_api_wallet_private_key.get_secret_value() == FAKE_KEY
+    assert without_key.hl_api_wallet_private_key is None

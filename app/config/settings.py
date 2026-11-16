@@ -151,12 +151,22 @@ class Settings(BaseSettings):
         }
 
 
+def env_files_from_environment() -> tuple[str, ...]:
+    """ERATRADE_ENV_FILE: один файл или несколько через запятую (последний имеет приоритет).
+
+    Пример: .env.mainnet,.env.mainnet.secrets — общие настройки отдельно от ключа,
+    чтобы процессы без права торговли (коллектор) не получали ключ API-кошелька.
+    """
+    raw = os.environ.get("ERATRADE_ENV_FILE", ".env")
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Настройки процесса. Файл окружения можно переопределить через ERATRADE_ENV_FILE."""
-    env_file = os.environ.get("ERATRADE_ENV_FILE", ".env")
+    """Настройки процесса. Файлы окружения задаются через ERATRADE_ENV_FILE."""
+    env_files = env_files_from_environment()
     try:
-        return Settings(_env_file=env_file)
+        return Settings(_env_file=env_files)
     except ValidationError as exc:
         # Сообщение без input_value: в нём могли бы оказаться DATABASE_URL или ключи.
         raise ConfigurationError(format_validation_error(exc)) from None

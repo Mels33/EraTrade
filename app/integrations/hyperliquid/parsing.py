@@ -4,6 +4,7 @@
 Числа приходят строками и переводятся в Decimal без потери точности.
 """
 
+import json
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -379,4 +380,40 @@ def parse_user_rate_limit(data: Any) -> RateLimitStatus:
         requests_surplus=_int(r, "nRequestsSurplus", "userRateLimit")
         if "nRequestsSurplus" in r
         else 0,
+    )
+
+
+# --- WebSocket ---
+
+
+def parse_ws_message(raw: str | bytes) -> tuple[str, Any]:
+    try:
+        message = json.loads(raw)
+    except ValueError as exc:
+        raise HyperliquidFormatError(f"ws: сообщение не JSON: {str(raw)[:200]!r}") from exc
+    obj = _obj(message, "ws")
+    return _str(obj, "channel", "ws"), obj.get("data")
+
+
+def parse_subscription_ack(data: Any) -> str:
+    """Тип подписки из subscriptionResponse."""
+    ack = _obj(data, "subscriptionResponse")
+    subscription = _obj(_get(ack, "subscription", "subscriptionResponse"), "subscription")
+    return _str(subscription, "type", "subscriptionResponse.subscription")
+
+
+def parse_ws_candle(data: Any, *, coin: str, interval: str, received_at: datetime) -> Candle:
+    """Свеча из WebSocket всегда сохраняется как незакрытая: финальные значения берутся из REST."""
+    entry = _obj(data, "ws.candle")
+    if _str(entry, "s", "ws.candle") != coin or _str(entry, "i", "ws.candle") != interval:
+        raise HyperliquidFormatError(f"ws.candle: чужая свеча {entry.get('s')} {entry.get('i')}")
+    return parse_candle(entry, received_at=received_at, source=DataSource.WS, is_closed=False)
+
+
+def parse_ws_asset_context(data: Any, *, coin: str, received_at: datetime) -> AssetContext:
+    entry = _obj(data, "ws.activeAssetCtx")
+    if _str(entry, "coin", "ws.activeAssetCtx") != coin:
+        raise HyperliquidFormatError(f"ws.activeAssetCtx: чужой инструмент {entry.get('coin')}")
+    return parse_asset_context(
+        _get(entry, "ctx", "ws.activeAssetCtx"), received_at, DataSource.WS, what="ws.ctx"
     )

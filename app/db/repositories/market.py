@@ -1,9 +1,9 @@
 """Запись и чтение рыночных данных. Функции не делают commit — транзакцией управляет вызывающий."""
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -11,6 +11,9 @@ from sqlalchemy.sql import func
 from app.config.settings import Network
 from app.db.models import CandleRecord, MarketContextSnapshotRecord, MarketRecord
 from app.domain.market import AssetContext, Candle, MarketMeta
+
+# 14 параметров на свечу; у PostgreSQL предел 32767 параметров на запрос.
+CANDLE_BATCH_SIZE = 1000
 
 
 async def upsert_market(session: AsyncSession, meta: MarketMeta) -> int:
@@ -57,8 +60,17 @@ async def upsert_candles(session: AsyncSession, market_id: int, candles: Sequenc
 
     Возвращает число реально вставленных или изменённых строк.
     """
-    if not candles:
-        return 0
+    written = 0
+    for offset in range(0, len(candles), CANDLE_BATCH_SIZE):
+        written += await _upsert_candle_batch(
+            session, market_id, candles[offset : offset + CANDLE_BATCH_SIZE]
+        )
+    return written
+
+
+async def _upsert_candle_batch(
+    session: AsyncSession, market_id: int, candles: Sequence[Candle]
+) -> int:
     rows = [
         {
             "market_id": market_id,
@@ -172,3 +184,51 @@ async def get_latest_context(
         .limit(1)
     )
     return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def find_missing_candles(
+    session: AsyncSession,
+    market_id: int,
+    interval: str,
+    step: timedelta,
+    start: datetime,
+    end: datetime,
+) -> list[datetime]:
+    """open_time закрытых свечей, которых нет в [start, end) с шагом step."""
+    stmt = text(
+        """
+        SELECT gs AS open_time
+        FROM generate_series(CAST(:start AS timestamptz), CAST(:last AS timestamptz),
+                             CAST(:step AS interval)) AS gs
+        LEFT JOIN candles c
+               ON c.market_id = :market_id AND c.interval = :interval
+              AND c.open_time = gs AND c.is_closed
+        WHERE c.open_time IS NULL
+        ORDER BY gs
+        """
+    )
+    if end <= start:
+        return []
+    params = {
+        "start": start,
+        "last": end - step,
+        "step": step,
+        "market_id": market_id,
+        "interval": interval,
+    }
+    return list((await session.execute(stmt, params)).scalars())
+
+
+async def candle_stats(
+    session: AsyncSession, market_id: int, interval: str
+) -> tuple[int, datetime | None, datetime | None]:
+    """(число закрытых свечей, первая open_time, последняя open_time)."""
+    stmt = select(
+        func.count(), func.min(CandleRecord.open_time), func.max(CandleRecord.open_time)
+    ).where(
+        CandleRecord.market_id == market_id,
+        CandleRecord.interval == interval,
+        CandleRecord.is_closed.is_(True),
+    )
+    count, first, last = (await session.execute(stmt)).one()
+    return int(count), first, last

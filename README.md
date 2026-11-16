@@ -13,6 +13,18 @@ uv run eratrade db-check
 uv run alembic upgrade head
 ```
 
+## Коллектор данных (mainnet, постоянно)
+
+Собирает публичные данные BTC 1h и funding/OI с mainnet в `eratrade_mainnet`
+(режим `DISABLED`, ключи не нужны). Плюс ежедневный бэкап обеих БД в `backups/` (14 дней).
+
+```bash
+cp .env.example.mainnet .env.mainnet            # пароль БД: eratrade_local для локального compose
+docker-compose --profile collector up -d --build
+docker logs -f eratrade-collector-mainnet
+ERATRADE_ENV_FILE=.env.mainnet uv run eratrade data-status
+```
+
 ## Управление (CLI)
 
 ```bash
@@ -20,6 +32,22 @@ uv run eratrade status                          # режим, запрет вх�
 uv run eratrade set-mode TESTNET -r "причина"   # смена режима, пишется в аудит
 uv run eratrade market                          # meta, funding/OI, свечи; meta сохраняется в БД
 uv run eratrade account                         # нужен HL_ACCOUNT_ADDRESS в .env
+uv run eratrade collect                         # коллектор в терминале (обычно — в Docker)
+uv run eratrade data-status                     # накоплено, пропуски, heartbeat коллектора
+uv run eratrade backfill --hours 48             # догрузить окно свечей через REST
+```
+
+Окружение выбирается через `ERATRADE_ENV_FILE` (один файл или несколько через запятую).
+Testnet не используется — работаем на mainnet с минимальными суммами (см. план).
+
+| Файл | Что внутри | Кто читает |
+|---|---|---|
+| `.env.mainnet` | сеть, БД, адрес аккаунта, токен Logfire | коллектор, CLI |
+| `.env.mainnet.secrets` | ключ API-кошелька (права 600) | только торговый процесс |
+
+```bash
+ERATRADE_ENV_FILE=.env.mainnet uv run eratrade account
+ERATRADE_ENV_FILE=.env.mainnet,.env.mainnet.secrets uv run eratrade config-check
 ```
 
 ## Проверки
