@@ -13,10 +13,18 @@ uv run eratrade db-check
 uv run alembic upgrade head
 ```
 
+## Управление (CLI)
+
+```bash
+uv run eratrade status                          # режим, запрет входов, heartbeat, аудит
+uv run eratrade set-mode TESTNET -r "причина"   # смена режима, пишется в аудит
+```
+
 ## Проверки
 
 ```bash
-uv run pytest
+uv run pytest          # БД-тесты используют eratrade_pytest_testnet и пропускаются без PostgreSQL
+uv run alembic check   # модели и миграции совпадают
 uv run ruff check .
 uv run mypy
 ```

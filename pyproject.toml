@@ -37,6 +37,7 @@ module-root = ""
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+extend-exclude = ["alembic/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "N", "S", "ASYNC", "RUF", "DTZ"]
@@ -59,3 +60,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "-ra"
+
+[[tool.mypy.overrides]]
+module = ["asyncpg", "asyncpg.*"]
+ignore_missing_imports = true
