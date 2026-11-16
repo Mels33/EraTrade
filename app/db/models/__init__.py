@@ -3,7 +3,12 @@
 Таблицы добавляются по этапам, см. §6.6 плана.
 """
 
-from app.db.models.control import AuditLogRecord, BotStateRecord, HeartbeatRecord
+from app.db.models.control import (
+    AuditLogRecord,
+    BotStateRecord,
+    HeartbeatRecord,
+    NonceStateRecord,
+)
 from app.db.models.market import CandleRecord, MarketContextSnapshotRecord, MarketRecord
 
 __all__ = [
@@ -13,4 +18,5 @@ __all__ = [
     "HeartbeatRecord",
     "MarketContextSnapshotRecord",
     "MarketRecord",
+    "NonceStateRecord",
 ]

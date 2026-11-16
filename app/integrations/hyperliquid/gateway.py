@@ -11,7 +11,15 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from app.config.settings import Network, Settings
-from app.domain.account import AccountState, Fill, OpenOrder, OrderStatusResult, RateLimitStatus
+from app.domain.account import (
+    AccountState,
+    AgentInfo,
+    Fill,
+    OpenOrder,
+    OrderStatusResult,
+    RateLimitStatus,
+    UserRole,
+)
 from app.domain.market import AssetContext, Candle, MarketMeta
 from app.integrations.hyperliquid import parsing
 from app.integrations.hyperliquid.errors import HyperliquidFormatError, UnknownMarketError
@@ -171,6 +179,14 @@ class HyperliquidGateway:
     async def get_user_rate_limit(self, user: str) -> RateLimitStatus:
         data = await self._client.post({"type": "userRateLimit", "user": normalize_address(user)})
         return parsing.parse_user_rate_limit(data)
+
+    async def get_user_role(self, address: str) -> UserRole:
+        data = await self._client.post({"type": "userRole", "user": normalize_address(address)})
+        return parsing.parse_user_role(data)
+
+    async def get_extra_agents(self, user: str) -> list[AgentInfo]:
+        data = await self._client.post({"type": "extraAgents", "user": normalize_address(user)})
+        return parsing.parse_extra_agents(data)
 
 
 @asynccontextmanager

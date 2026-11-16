@@ -24,3 +24,18 @@ class HyperliquidFormatError(HyperliquidError):
 
 class UnknownMarketError(HyperliquidRequestError):
     """Инструмента нет в метаданных биржи."""
+
+
+class ExchangeNotSentError(HyperliquidError):
+    """Запрос гарантированно не дошёл до биржи (не удалось установить соединение)."""
+
+
+class ExchangeOutcomeUnknownError(HyperliquidError):
+    """Запрос мог быть обработан, но подтверждения нет (таймаут, обрыв, 5xx, непонятный ответ).
+
+    Повторять действие нельзя: сначала сверка состояния с биржей (§10.4 плана).
+    """
+
+
+class ExchangeResponseFormatError(ExchangeOutcomeUnknownError, HyperliquidFormatError):
+    """Ответ /exchange неизвестного формата: исход неизвестен, новые действия нужно остановить."""

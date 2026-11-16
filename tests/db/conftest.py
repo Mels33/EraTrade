@@ -97,7 +97,9 @@ async def committing_sessionmaker(
     Данные реально коммитятся; рыночные таблицы очищаются до и после теста
     (audit_log не трогается — его очистка запрещена триггером)."""
     engine = create_async_engine(migrated_db, poolclass=NullPool)
-    truncate = text("TRUNCATE candles, market_context_snapshots, heartbeats, markets CASCADE")
+    truncate = text(
+        "TRUNCATE candles, market_context_snapshots, heartbeats, markets, nonce_state CASCADE"
+    )
     async with engine.begin() as conn:
         await conn.execute(truncate)
     try:

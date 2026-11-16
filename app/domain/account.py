@@ -105,3 +105,21 @@ class RateLimitStatus:
     @property
     def remaining(self) -> int:
         return self.requests_cap + self.requests_surplus - self.requests_used
+
+
+@dataclass(frozen=True, slots=True)
+class UserRole:
+    """Роль адреса на Hyperliquid (info userRole)."""
+
+    role: str  # "user", "agent", "subAccount", "vault", "missing"
+    agent_owner: str | None = None  # для agent: аккаунт, который одобрил API-кошелёк
+    master: str | None = None  # для subAccount: основной аккаунт
+
+
+@dataclass(frozen=True, slots=True)
+class AgentInfo:
+    """Именованный API-кошелёк аккаунта (info extraAgents)."""
+
+    address: str
+    name: str
+    valid_until: datetime | None

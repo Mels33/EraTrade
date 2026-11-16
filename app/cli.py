@@ -27,7 +27,9 @@ from app.db.repositories.market import upsert_market
 from app.db.session import create_engine, create_sessionmaker
 from app.domain.control import Actor, ActorKind, TransitionError
 from app.domain.instruments import InstrumentRules, Rounding
-from app.integrations.hyperliquid.gateway import INTERVALS, open_gateway
+from app.execution.session import TradingSession, open_trading_session
+from app.integrations.hyperliquid import actions as hl_actions
+from app.integrations.hyperliquid.gateway import INTERVALS, HyperliquidGateway, open_gateway
 from app.market_data.collector import COMPONENT as COLLECTOR
 from app.market_data.collector import CollectorConfig, MarketDataCollector, floor_time
 from app.market_data.gaps import compress_ranges
@@ -410,6 +412,91 @@ def data_status(
                 typer.echo(f"  последняя ошибка: {heartbeat.details['last_error']}")
 
     _run_in_transaction(settings, _status)
+
+
+async def _with_trading_session[T](
+    settings: Settings, fn: Callable[[TradingSession, HyperliquidGateway], Awaitable[T]]
+) -> T:
+    engine = create_engine(settings)
+    try:
+        async with (
+            open_gateway(settings) as gw,
+            open_trading_session(settings, engine, gw) as session,
+        ):
+            return await fn(session, gw)
+    finally:
+        await engine.dispose()
+
+
+def _print_wallet(session: TradingSession) -> None:
+    w = session.wallet
+    typer.echo(f"API-кошелёк (signer): {w.signer}  имя: {w.agent_name or '—'}")
+    typer.echo(f"Торговый аккаунт:     {w.account}" + ("  (субаккаунт)" if w.vault_address else ""))
+    if w.valid_until:
+        typer.echo(f"Действителен до:      {w.valid_until:%Y-%m-%d %H:%M} UTC")
+    typer.echo(f"Расхождение часов:    {session.clock_skew.total_seconds():+.3f} с")
+    for warning in w.warnings:
+        typer.secho(f"ВНИМАНИЕ: {warning}", fg=typer.colors.YELLOW)
+
+
+@app.command("wallet-check")
+def wallet_check() -> None:
+    """Проверить ключ API-кошелька, срок действия, часы и блокировку. Ничего не подписывает."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+
+    async def _check(session: TradingSession, gw: HyperliquidGateway) -> int | None:
+        _print_wallet(session)
+        return await session.nonces.last()
+
+    try:
+        last_nonce = asyncio.run(_with_trading_session(settings, _check))
+    except Exception as exc:
+        typer.secho(f"Проверка не пройдена: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"Последний nonce:      {last_nonce or 'ещё не выдавался'}")
+    typer.secho(
+        "OK: ключ годен для торговли, второй торговый процесс не запущен", fg=typer.colors.GREEN
+    )
+
+
+@app.command("verify-signing")
+def verify_signing(
+    yes: bool = typer.Option(False, "--yes", help="Подтвердить отправку без вопроса"),
+) -> None:
+    """Проверить подпись на бирже: отмена несуществующего ордера (ничего не меняет)."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+    strategy = load_strategy(settings.strategy_config_path)
+    network = settings.network.value.upper()
+    if not yes and not typer.confirm(
+        f"Отправить на {network} подписанную отмену несуществующего ордера {strategy.market.coin}?"
+    ):
+        raise typer.Exit(code=1)
+
+    async def _verify(session: TradingSession, gw: HyperliquidGateway) -> tuple[bool, str]:
+        _print_wallet(session)
+        market = await gw.get_market(strategy.market.coin)
+        response = await session.submit(hl_actions.cancel_action(market.asset_id, 1))
+        if not response.ok:
+            return False, f"биржа отклонила запрос: {response.error}"
+        statuses = (response.data or {}).get("statuses") or [None]
+        status = statuses[0]
+        if isinstance(status, dict) and "never placed" in str(status.get("error", "")):
+            return True, "биржа узнала API-кошелёк и проверила подпись (ордер не найден — ожидаемо)"
+        return False, f"неожиданный ответ: {response.raw}"
+
+    try:
+        ok, message = asyncio.run(_with_trading_session(settings, _verify))
+    except Exception as exc:
+        typer.secho(f"Ошибка: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+    typer.secho(
+        ("OK: " if ok else "НЕ ПРОЙДЕНО: ") + message,
+        fg=typer.colors.GREEN if ok else typer.colors.RED,
+    )
+    if not ok:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

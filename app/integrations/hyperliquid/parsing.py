@@ -13,12 +13,14 @@ from typing import Any
 from app.config.settings import Network
 from app.domain.account import (
     AccountState,
+    AgentInfo,
     Fill,
     OpenOrder,
     OrderStatusResult,
     Position,
     RateLimitStatus,
     Side,
+    UserRole,
 )
 from app.domain.market import AssetContext, Candle, DataSource, MarketMeta
 from app.integrations.hyperliquid.errors import HyperliquidFormatError
@@ -417,3 +419,40 @@ def parse_ws_asset_context(data: Any, *, coin: str, received_at: datetime) -> As
     return parse_asset_context(
         _get(entry, "ctx", "ws.activeAssetCtx"), received_at, DataSource.WS, what="ws.ctx"
     )
+
+
+# --- роли и API-кошельки ---
+
+
+def _address(value: Any, what: str) -> str:
+    if not isinstance(value, str) or not value.startswith("0x") or len(value) != 42:
+        raise HyperliquidFormatError(f"{what}: ожидался адрес, получено {value!r}")
+    return value.lower()
+
+
+def parse_user_role(data: Any) -> UserRole:
+    r = _obj(data, "userRole")
+    role = _str(r, "role", "userRole")
+    details = r.get("data")
+    if role == "agent":
+        d = _obj(details, "userRole.data")
+        return UserRole(role=role, agent_owner=_address(_get(d, "user", "userRole.data"), "user"))
+    if role == "subAccount":
+        d = _obj(details, "userRole.data")
+        return UserRole(role=role, master=_address(_get(d, "master", "userRole.data"), "master"))
+    return UserRole(role=role)
+
+
+def parse_extra_agents(data: Any) -> list[AgentInfo]:
+    agents = []
+    for i, item in enumerate(_list(data, "extraAgents")):
+        a = _obj(item, f"extraAgents[{i}]")
+        valid_until = a.get("validUntil")
+        agents.append(
+            AgentInfo(
+                address=_address(_get(a, "address", "extraAgents"), "extraAgents.address"),
+                name=_str(a, "name", "extraAgents"),
+                valid_until=ms_to_datetime(valid_until) if isinstance(valid_until, int) else None,
+            )
+        )
+    return agents

@@ -67,3 +67,17 @@ class HeartbeatRecord(Base):
     started_at: Mapped[datetime]
     last_beat_at: Mapped[datetime]
     details: Mapped[dict[str, Any]] = mapped_column(server_default=text("'{}'::jsonb"))
+
+
+class NonceStateRecord(Base):
+    """Последний выданный nonce для каждого подписывающего API-кошелька.
+
+    Nonce выдаётся атомарно в БД: max(текущее время в мс, последний + 1), поэтому
+    повтор невозможен даже после рестарта или при ошибочном втором процессе.
+    """
+
+    __tablename__ = "nonce_state"
+
+    signer: Mapped[str] = mapped_column(primary_key=True)
+    last_nonce: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())

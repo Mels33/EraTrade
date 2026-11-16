@@ -48,7 +48,16 @@ Testnet не используется — работаем на mainnet с ми�
 ```bash
 ERATRADE_ENV_FILE=.env.mainnet uv run eratrade account
 ERATRADE_ENV_FILE=.env.mainnet,.env.mainnet.secrets uv run eratrade config-check
+ERATRADE_ENV_FILE=.env.mainnet,.env.mainnet.secrets uv run eratrade wallet-check     # только чтение
+ERATRADE_ENV_FILE=.env.mainnet,.env.mainnet.secrets uv run eratrade verify-signing   # no-op отмена
 ```
+
+Защита торгового процесса (этап 5):
+- подписываются только `order`, `cancel`, `cancelByCloid`, `updateLeverage`, `scheduleCancel` —
+  вывод средств и переводы невозможны даже при ошибке в коде;
+- nonce выдаётся атомарно в PostgreSQL (`max(now_ms, last + 1)`), переживает рестарт;
+- второй торговый процесс с тем же API-кошельком не запустится (advisory lock);
+- при старте проверяются роль ключа (agent, не основной кошелёк), срок действия, часы (±2 с).
 
 ## Проверки
 
