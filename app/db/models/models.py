@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -75,6 +76,11 @@ class SignalRecord(Base):
         UniqueConstraint("market_id", "decision_time", "model_version"),
         CheckConstraint("decision in ('BUY', 'SELL', 'HOLD', 'EXIT')", name="decision"),
         CheckConstraint("model_role in ('active', 'shadow')", name="model_role"),
+        CheckConstraint(
+            "execution_status is null or execution_status in "
+            "('executing', 'executed', 'blocked', 'declined', 'skipped', 'error', 'none')",
+            name="execution_status",
+        ),
         Index("ix_signals_decision_time", "decision_time"),
     )
 
@@ -95,3 +101,10 @@ class SignalRecord(Base):
     outcome_return: Mapped[float | None]
     outcome_label: Mapped[str | None]
     outcome_at: Mapped[datetime | None]
+    # Исполнение active-сигнала (этап 12). null — ещё не обрабатывался; executing ставится
+    # атомарно до первого обращения к бирже, поэтому сигнал не исполняется дважды.
+    execution_status: Mapped[str | None]
+    execution_detail: Mapped[str | None]
+    execution_order_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("orders.id"))
+    execution_started_at: Mapped[datetime | None]
+    execution_finished_at: Mapped[datetime | None]

@@ -47,6 +47,7 @@ from app.reconciliation.reconciler import (
     ReconciliationReport,
     Severity,
 )
+from app.workers.trader import CycleReport, TradingCycle
 
 # show_locals=False: локальные переменные (настройки, ключи) не печатаются в трейсбеке.
 app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_show_locals=False)
@@ -540,8 +541,14 @@ async def _with_engine[T](settings: Settings, fn: Callable[[ExecutionEngine], Aw
     return await _with_trading_session(settings, _run)
 
 
-def _make_confirm(settings: Settings) -> Callable[[OrderPreview], Awaitable[bool]]:
+def _make_confirm(
+    settings: Settings, *, timeout: float | None = None
+) -> Callable[[OrderPreview], Awaitable[bool]]:
+    """Ручное подтверждение ордера. timeout — если оператор ответил позже, цена в превью
+    устарела, и ордер не отправляется (для торгового цикла)."""
+
     async def confirm(p: OrderPreview) -> bool:
+        shown = asyncio.get_running_loop().time()
         if settings.is_mainnet:
             typer.secho("MAINNET — реальные деньги", fg=typer.colors.RED, bold=True)
         spread = f"{p.spread_bps:.2f} bps" if p.spread_bps is not None else "нет данных"
@@ -563,7 +570,16 @@ def _make_confirm(settings: Settings) -> Callable[[OrderPreview], Awaitable[bool
                 f"риск на сделку {p.risk_amount:.4f} USDC; размер ограничен: "
                 + ", ".join(p.sizing_limited_by)
             )
-        return typer.confirm("Отправить ордер?", default=False)
+        question = "Отправить ордер?" + (f" (ответ в течение {timeout:.0f} с)" if timeout else "")
+        answer = await asyncio.to_thread(typer.confirm, question, default=False)
+        elapsed = asyncio.get_running_loop().time() - shown
+        if answer and timeout is not None and elapsed > timeout:
+            typer.secho(
+                f"Подтверждение через {elapsed:.0f} с — цена устарела, ордер не отправлен",
+                fg=typer.colors.YELLOW,
+            )
+            return False
+        return answer
 
     return confirm
 
@@ -1364,6 +1380,100 @@ def signal_outcomes_cmd() -> None:
         )
 
     typer.echo(f"Заполнено результатов: {_run_in_transaction(settings, _fill)}")
+
+
+# --- торговый цикл (этап 12) ---
+
+
+def _print_cycle(report: "CycleReport") -> None:
+    signal = report.signal
+    typer.secho(f"Проход {report.decision_time:%Y-%m-%d %H:%M} UTC", bold=True)
+    for warning in report.warnings:
+        typer.secho(f"  ! {warning}", fg=typer.colors.YELLOW)
+    if report.reconciliation_critical:
+        typer.secho("  сверка: критичные расхождения — входы запрещены", fg=typer.colors.RED)
+    if signal is not None:
+        if signal.feature_error:
+            typer.secho(f"  {signal.feature_error}", fg=typer.colors.YELLOW)
+        for d in signal.decisions:
+            probs = (
+                " ".join(f"{k} {v:.2f}" for k, v in d.probabilities.items())
+                if d.probabilities
+                else "—"
+            )
+            typer.echo(f"  [{d.role}] {d.decision.value} · {probs} · {d.reason}")
+    color = {"executed": typer.colors.GREEN, "error": typer.colors.RED}.get(
+        report.execution_status or ""
+    )
+    typer.secho(
+        f"  исполнение: {report.execution_status} {report.execution_detail}".rstrip(), fg=color
+    )
+    if report.outcomes_filled:
+        typer.echo(f"  результатов сигналов заполнено: {report.outcomes_filled}")
+
+
+def _with_cycle(
+    settings: Settings, fn: Callable[["TradingCycle"], Awaitable[None]], confirm_timeout: float
+) -> None:
+    from app.signals.policy import PolicyParams
+    from app.signals.service import PredictorCache
+    from app.workers.trader import TradingCycle
+
+    strategy = load_strategy(settings.strategy_config_path)
+    interval = strategy.market.interval
+    step = INTERVALS[interval]
+
+    async def _run(engine: ExecutionEngine) -> None:
+        cycle = TradingCycle(
+            engine,
+            PredictorCache(settings.models_dir),
+            params=PolicyParams.from_strategy(strategy, step),
+            interval=interval,
+            step=step,
+            max_delay=timedelta(seconds=strategy.freshness.max_decision_delay_seconds),
+            confirm=_make_confirm(settings, timeout=confirm_timeout),
+        )
+        await fn(cycle)
+
+    asyncio.run(_with_engine(settings, _run))
+
+
+@app.command("cycle")
+def cycle_cmd(
+    confirm_timeout: float = typer.Option(60, help="Сколько секунд ждать подтверждения ордера"),
+) -> None:
+    """Один проход торгового цикла по последней закрытой свече (ордера — с подтверждением).
+    Решение старше freshness.max_decision_delay_seconds не исполняется."""
+    settings = _load_settings()
+    configure_logging(settings, service="trader")
+
+    async def _once(cycle: "TradingCycle") -> None:
+        _print_cycle(await cycle.run_once())
+
+    _with_cycle(settings, _once, confirm_timeout)
+
+
+@app.command("trader")
+def trader_cmd(
+    confirm_timeout: float = typer.Option(60, help="Сколько секунд ждать подтверждения ордера"),
+) -> None:
+    """Торговый цикл: проход после закрытия каждой свечи. Держит блокировку единственного
+    trader-процесса; каждый ордер подтверждается в этом терминале. Ctrl+C — остановить."""
+    settings = _load_settings()
+    configure_logging(settings, service="trader")
+    typer.secho(
+        f"Торговый цикл {settings.network.value.upper()} запущен. Проход — через 5 с после "
+        "закрытия каждой часовой свечи. Ctrl+C — остановить.",
+        bold=True,
+    )
+
+    async def _loop(cycle: "TradingCycle") -> None:
+        await cycle.run_forever(on_report=_print_cycle)
+
+    try:
+        _with_cycle(settings, _loop, confirm_timeout)
+    except KeyboardInterrupt:
+        typer.echo("Остановлено оператором")
 
 
 if __name__ == "__main__":

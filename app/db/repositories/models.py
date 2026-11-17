@@ -8,11 +8,12 @@
   модель не меняется посреди обработки одного сигнала.
 """
 
+import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -245,3 +246,39 @@ async def signals_without_outcome(
         .order_by(SignalRecord.decision_time)
     )
     return list((await session.execute(stmt)).scalars())
+
+
+# --- исполнение active-сигнала (этап 12) ---
+
+
+async def claim_execution(session: AsyncSession, signal_id: int, now: datetime) -> bool:
+    """Атомарно забирает сигнал на исполнение. False — его уже обрабатывали (в т.ч. процесс,
+    упавший посреди исполнения): повторно не исполняем, ордер разбирают tracker и сверка."""
+    stmt = (
+        update(SignalRecord)
+        .where(SignalRecord.id == signal_id, SignalRecord.execution_status.is_(None))
+        .values(execution_status="executing", execution_started_at=now)
+        .returning(SignalRecord.id)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+
+async def finish_execution(
+    session: AsyncSession,
+    signal_id: int,
+    *,
+    status: str,
+    detail: str,
+    now: datetime,
+    order_id: uuid.UUID | None = None,
+) -> None:
+    await session.execute(
+        update(SignalRecord)
+        .where(SignalRecord.id == signal_id)
+        .values(
+            execution_status=status,
+            execution_detail=detail[:2000],
+            execution_order_id=order_id,
+            execution_finished_at=now,
+        )
+    )

@@ -190,3 +190,9 @@ def test_order_request_validation() -> None:
     cloid = actions.new_cloid()
     assert actions.validate_cloid(cloid) == cloid
     assert actions.action_weight({"type": "order", "orders": [{}] * 80}) == 3
+
+
+def test_cloids_are_unique_and_valid() -> None:
+    cloids = {actions.new_cloid() for _ in range(10_000)}
+    assert len(cloids) == 10_000
+    assert all(actions.validate_cloid(c) == c for c in cloids)
