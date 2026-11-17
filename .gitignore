@@ -24,4 +24,5 @@ artifacts/
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
-data/
+/data/
+/models/

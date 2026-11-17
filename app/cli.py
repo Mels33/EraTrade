@@ -7,6 +7,7 @@ import signal
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import typer
 from sqlalchemy import select, text
@@ -1103,6 +1104,266 @@ def dataset_cmd(
         )
     )
     typer.echo(f"sha256 набора: {manifest['dataset_sha256']}")
+
+
+# --- модели и сигналы (этап 11) ---
+
+
+def _print_metrics(meta: dict[str, Any]) -> None:
+    metrics = meta["metrics"]
+    typer.echo(
+        f"{'участок':<12}{'строк':>6}{'logloss':>9}{'baseline':>9}{'brier':>8}{'ECE':>7}"
+        f"{'сигналов':>10}{'precision':>11}{'ср. нетто':>11}"
+    )
+    for name in ("validation", "calibration", "test"):
+        m = metrics[name]
+        pol = m["policy"]
+        signals = pol["buy_signals"] + pol["sell_signals"]
+        precision = f"{pol['precision']:.0%}" if pol["precision"] is not None else "—"
+        net = f"{pol['mean_net_return']:+.3%}" if pol["mean_net_return"] is not None else "—"
+        mark = "" if m["beats_baseline"] else " ✗"
+        typer.echo(
+            f"{name:<12}{m['rows']:>6}{m['log_loss']:>9.4f}{m['baseline_log_loss']:>9.4f}"
+            f"{m['brier']:>8.4f}{m['ece']:>7.3f}{signals:>10}{precision:>11}{net:>11}{mark}"
+        )
+
+
+@app.command("train")
+def train_cmd(
+    dataset: str | None = typer.Option(
+        None, help="Каталог набора (по умолчанию — самый свежий в data/datasets)"
+    ),
+    register: bool = typer.Option(True, help="Зарегистрировать версию в БД как candidate"),
+) -> None:
+    """Обучить CatBoost на наборе, откалибровать, проверить на test и сохранить артефакт."""
+    from pathlib import Path
+
+    from app.db.repositories import models as models_repo
+    from app.models.training import TrainingError, train_model
+    from app.signals.policy import PolicyParams
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    step = INTERVALS[strategy.market.interval]
+    if dataset is None:
+        candidates = sorted(Path("data/datasets").glob("*/manifest.json"))
+        if not candidates:
+            typer.secho("Нет наборов — сначала `eratrade dataset`", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        dataset_dir = candidates[-1].parent
+    else:
+        dataset_dir = Path(dataset)
+    try:
+        artifact = train_model(
+            dataset_dir,
+            strategy,
+            PolicyParams.from_strategy(strategy, step),
+            settings.models_dir,
+        )
+    except TrainingError as exc:
+        typer.secho(f"Обучение невозможно: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(code=1) from None
+    meta = artifact.meta
+    typer.secho(f"Модель {artifact.version}", bold=True)
+    typer.echo(
+        f"Набор: {dataset_dir} · итераций {meta['catboost']['best_iteration']} · "
+        f"температура {meta['calibration']['temperature']:.3f}"
+    )
+    _print_metrics(meta)
+    top = list(meta["feature_importance"].items())[:6]
+    typer.echo("Важные признаки: " + ", ".join(f"{k} {v:.1f}" for k, v in top))
+    typer.echo("Порог p(класс) на validation (сигналов / ср. нетто):")
+    for row in meta["threshold_sweep_validation"]:
+        n = row["buy_signals"] + row["sell_signals"]
+        net = f"{row['mean_net_return']:+.3%}" if row["mean_net_return"] is not None else "—"
+        typer.echo(f"  p ≥ {row['min_probability']:.2f}: {n:>4} / {net}")
+    typer.echo(f"Артефакт: {artifact.path}")
+
+    if register:
+        relative = artifact.path.relative_to(settings.models_dir)
+
+        async def _register(session: AsyncSession) -> None:
+            await models_repo.register_model(
+                session, artifact, actor=_operator(), artifact_path=str(relative)
+            )
+
+        _run_in_transaction(settings, _register)
+        typer.secho(
+            "Зарегистрирована как candidate. Дальше: eratrade model-shadow " + artifact.version,
+            fg=typer.colors.GREEN,
+        )
+
+
+@app.command("models")
+def models_cmd() -> None:
+    """Версии моделей и их статусы."""
+    from app.db.repositories import models as models_repo
+
+    settings = _load_settings()
+
+    async def _list(session: AsyncSession) -> None:
+        records = await models_repo.list_models(session)
+        if not records:
+            typer.echo("Моделей нет — `eratrade train`")
+        for r in records:
+            test = r.artifact["metrics"]["test"]
+            color = {"active": typer.colors.GREEN, "shadow": typer.colors.CYAN}.get(r.status)
+            typer.secho(
+                f"{r.version:<34} {r.status:<10} test logloss {test['log_loss']:.4f} "
+                f"(baseline {test['baseline_log_loss']:.4f}) · "
+                f"создана {r.created_at:%Y-%m-%d %H:%M}",
+                fg=color,
+            )
+
+    _run_in_transaction(settings, _list)
+
+
+def _model_transition(version: str, reason: str, action: str) -> None:
+    from app.db.repositories import models as models_repo
+
+    settings = _load_settings()
+    ops = {
+        "shadow": models_repo.set_shadow,
+        "activate": models_repo.activate,
+        "retire": models_repo.retire,
+    }
+
+    async def _apply(session: AsyncSession) -> str:
+        record = await ops[action](session, version, actor=_operator(), reason=reason)
+        return record.status
+
+    try:
+        status = _run_in_transaction(settings, _apply)
+    except models_repo.RegistryError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+    typer.secho(f"{version}: {status}", fg=typer.colors.GREEN)
+
+
+@app.command("model-shadow")
+def model_shadow_cmd(
+    version: str, reason: str = typer.Option(..., help="Причина (в аудит)")
+) -> None:
+    """Перевести модель в shadow: сигналы считаются и сохраняются, но не исполняются."""
+    _model_transition(version, reason, "shadow")
+
+
+@app.command("model-activate")
+def model_activate_cmd(
+    version: str,
+    reason: str = typer.Option(..., help="Причина (в аудит)"),
+    yes: bool = typer.Option(False, "--yes", help="Без интерактивного подтверждения"),
+) -> None:
+    """Сделать модель активной (только после shadow или откат на прежнюю активную)."""
+    if not yes:
+        typer.confirm(
+            f"Активировать {version}? Её сигналы будут использоваться для торговли", abort=True
+        )
+    _model_transition(version, reason, "activate")
+
+
+@app.command("model-retire")
+def model_retire_cmd(
+    version: str, reason: str = typer.Option(..., help="Причина (в аудит)")
+) -> None:
+    """Вывести модель из работы (остаётся в реестре для отката)."""
+    _model_transition(version, reason, "retire")
+
+
+@app.command("signal")
+def signal_cmd(
+    at: str | None = typer.Option(
+        None, help="Момент решения (ISO UTC) — пробный расчёт без сохранения"
+    ),
+) -> None:
+    """Сигнал на последнюю закрытую свечу: признаки → модели (active и shadow) → политика.
+    Сохраняется в БД, ордера НЕ отправляются."""
+    from app.domain.account import Side
+    from app.features.pipeline import FeatureError
+    from app.signals.policy import PolicyParams
+    from app.signals.service import PredictorCache, generate_signal, position_context
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin, interval = strategy.market.coin, strategy.market.interval
+    step = INTERVALS[interval]
+    decision_time = _parse_time(at)
+
+    async def _run() -> None:
+        side: Side | None = None
+        if settings.hl_account_address is not None:
+            async with open_gateway(settings) as gw:
+                state = await gw.get_account_state(settings.hl_account_address)
+            pos = state.position(coin)
+            if pos is not None and pos.size != 0:
+                side = Side.BUY if pos.size > 0 else Side.SELL
+        engine = create_engine(settings)
+        try:
+            async with create_sessionmaker(engine).begin() as session:
+                market_id = await _market_id(session, settings, coin)
+                position = await position_context(session, market_id, side)
+                result = await generate_signal(
+                    session,
+                    market_id=market_id,
+                    interval=interval,
+                    step=step,
+                    params=PolicyParams.from_strategy(strategy, step),
+                    position=position,
+                    predictors=PredictorCache(settings.models_dir),
+                    decision_time=decision_time,
+                    persist=decision_time is None,
+                )
+        finally:
+            await engine.dispose()
+        typer.secho(
+            f"Сигнал на {result.decision_time:%Y-%m-%d %H:%M} UTC · позиция: "
+            f"{position.side.value if position.side else 'нет'}"
+            + ("" if decision_time is None else " · пробный расчёт, не сохранён"),
+            bold=True,
+        )
+        if result.feature_error:
+            typer.secho(result.feature_error, fg=typer.colors.YELLOW)
+        if not result.decisions:
+            typer.secho("Нет моделей в статусе active или shadow", fg=typer.colors.YELLOW)
+        for d in result.decisions:
+            probs = (
+                " ".join(f"{k} {v:.2f}" for k, v in d.probabilities.items())
+                if d.probabilities
+                else "—"
+            )
+            typer.echo(
+                f"  [{d.role}] {d.version}: {d.decision.value}"
+                + (" (уже было)" if d.replay else "")
+                + f"\n      p: {probs}\n      {d.reason}"
+            )
+
+    try:
+        asyncio.run(_run())
+    except FeatureError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(code=1) from None
+
+
+@app.command("signal-outcomes")
+def signal_outcomes_cmd() -> None:
+    """Заполнить фактический результат сигналов, у которых наступил горизонт."""
+    from app.signals.service import fill_outcomes
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin, interval = strategy.market.coin, strategy.market.interval
+
+    async def _fill(session: AsyncSession) -> int:
+        return await fill_outcomes(
+            session,
+            market_id=await _market_id(session, settings, coin),
+            interval=interval,
+            step=INTERVALS[interval],
+            threshold_bps=strategy.target.threshold_bps,
+            now=datetime.now(UTC),
+        )
+
+    typer.echo(f"Заполнено результатов: {_run_in_transaction(settings, _fill)}")
 
 
 if __name__ == "__main__":

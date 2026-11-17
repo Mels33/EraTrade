@@ -23,6 +23,7 @@ from app.config.settings import MAINNET_CONFIRMATION_PHRASE, TradingMode
 from app.db.models import ApiRequestRecord, AuditLogRecord, FillRecord
 from app.db.repositories import control
 from app.db.repositories import market as market_repo
+from app.db.repositories import models as models_repo
 from app.db.repositories import reconciliation as rec_repo
 from app.db.repositories import trading as trading_repo
 from app.domain.control import Actor, ActorKind, TransitionError
@@ -313,13 +314,61 @@ async def audit(ctx: Ctx, limit: Annotated[int, Query(ge=1, le=500)] = 50) -> li
 
 
 @read.get("/signals")
-async def signals() -> dict[str, Any]:
-    return {"items": [], "note": "сигналы модели появятся на этапах 10–11"}
+async def signals(ctx: Ctx, limit: Annotated[int, Query(ge=1, le=500)] = 50) -> dict[str, Any]:
+    async with ctx.sm() as db:
+        records = await models_repo.list_signals(db, limit=limit)
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "decision_time": _t(r.decision_time),
+                "model_version": r.model_version,
+                "model_role": r.model_role,
+                "policy_version": r.policy_version,
+                "decision": r.decision,
+                "reason": r.reason,
+                "probabilities": r.probabilities,
+                "expected_return_bps": r.expected_return_bps,
+                "position_side": r.position_side,
+                "outcome_return": r.outcome_return,
+                "outcome_label": r.outcome_label,
+            }
+            for r in records
+        ]
+    }
+
+
+def _test_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
+    test = artifact.get("metrics", {}).get("test", {})
+    return {
+        "log_loss": test.get("log_loss"),
+        "baseline_log_loss": test.get("baseline_log_loss"),
+        "brier": test.get("brier"),
+        "ece": test.get("ece"),
+        "policy": test.get("policy"),
+    }
 
 
 @read.get("/models")
-async def models() -> dict[str, Any]:
-    return {"items": [], "note": "версии моделей появятся на этапах 10–11"}
+async def models(ctx: Ctx) -> dict[str, Any]:
+    async with ctx.sm() as db:
+        records = await models_repo.list_models(db)
+    return {
+        "items": [
+            {
+                "version": r.version,
+                "status": r.status,
+                "feature_set_version": r.feature_set_version,
+                "created_at": _t(r.created_at),
+                "shadow_at": _t(r.shadow_at),
+                "activated_at": _t(r.activated_at),
+                "retired_at": _t(r.retired_at),
+                "training_period": r.artifact.get("training_period"),
+                "test": _test_metrics(r.artifact),
+            }
+            for r in records
+        ]
+    }
 
 
 # --- управление ---
@@ -479,8 +528,16 @@ async def bot_kill(
 
 
 @control_router.post("/models/{version}/activate")
-async def activate_model(version: str, actor: Operator) -> JSONResponse:
-    return JSONResponse({"detail": "управление моделями появится на этапе 11"}, status_code=501)
+async def activate_model(
+    version: str, body: CommandBody, ctx: Ctx, actor: Operator, key: IdemKey = None
+) -> JSONResponse:
+    async def run() -> dict[str, Any]:
+        _require_confirm(body, "ACTIVATE")
+        async with ctx.sm.begin() as db:
+            record = await models_repo.activate(db, version, actor=actor, reason=body.reason)
+        return {"steps": [f"{record.version}: {record.status}"]}
+
+    return await _idempotent(ctx, key, f"model-activate:{version}", actor, run)
 
 
 def create_api(

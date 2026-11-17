@@ -69,3 +69,10 @@ expected_slippage_bps = "2"    # за сторону (лимит — limits.max_
 expected_funding_bps = "0.5"   # ~0.00125%/ч × 4 ч
 safety_margin_bps = "5"
 min_edge_bps = "20"
+
+[signal]
+# Торговая политика поверх вероятностей модели (docs/spec.md §7). Иначе — HOLD.
+min_probability = "0.45"   # p(UP) для BUY / p(DOWN) для SELL не ниже
+min_margin = "0.15"        # p(UP) − p(DOWN) для BUY (и наоборот для SELL) не ниже
+# Ожидаемая доходность E[r] = Σ p(класс) × средняя доходность класса на train
+# должна превышать target.cost_bps + target.safety_margin_bps.

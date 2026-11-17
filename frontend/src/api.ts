@@ -168,3 +168,30 @@ export interface CommandResult {
   steps: string[];
   warnings?: string[];
 }
+
+export interface Signal {
+  id: number;
+  decision_time: string;
+  model_version: string;
+  model_role: "active" | "shadow";
+  decision: "BUY" | "SELL" | "HOLD" | "EXIT";
+  reason: string;
+  probabilities: Record<string, number> | null;
+  expected_return_bps: number | null;
+  position_side: string | null;
+  outcome_return: number | null;
+  outcome_label: string | null;
+}
+
+export interface ModelVersion {
+  version: string;
+  status: "candidate" | "shadow" | "active" | "retired";
+  created_at: string;
+  activated_at: string | null;
+  test: {
+    log_loss: number | null;
+    baseline_log_loss: number | null;
+    ece: number | null;
+    policy: { buy_signals: number; sell_signals: number; precision: number | null; mean_net_return: number | null } | null;
+  };
+}

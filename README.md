@@ -142,6 +142,26 @@ uv run eratrade dataset                  # набор в data/datasets/<сеть
 target, распределение классов, baseline log loss / Brier, sha256 исходных данных и набора).
 Funding копит коллектор; история загружается `eratrade backfill --hours 5100`.
 
+## Модели и сигналы (этап 11)
+
+```bash
+export ERATRADE_ENV_FILE=.env.mainnet
+uv run eratrade train                    # обучить на свежем наборе → models/<версия>/, candidate
+uv run eratrade models                   # версии и статусы
+uv run eratrade model-shadow <версия> --reason "..."    # сигналы считаются, не исполняются
+uv run eratrade model-activate <версия> --reason "..."  # только после shadow (или откат)
+uv run eratrade model-retire <версия> --reason "..."
+uv run eratrade signal                   # сигнал на последнюю закрытую свечу (в БД, без ордеров)
+uv run eratrade signal --at 2026-11-17T12:00   # пробный расчёт без сохранения
+uv run eratrade signal-outcomes          # фактический результат сигналов после горизонта
+```
+
+`train` печатает log loss / Brier / ECE против baseline на validation, calibration и test,
+сигналы политики и их среднюю доходность за горизонт минус издержки, перебор порога
+вероятности. Артефакт (`model.cbm` + `artifact.json`) хранит признаки и хеш кода pipeline,
+границы признаков, температуру калибровки, пороги, метрики и хеши набора и модели.
+Если код pipeline изменился после обучения, модель не загрузится — нужна новая версия.
+
 ## Проверки
 
 ```bash

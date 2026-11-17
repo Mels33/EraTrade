@@ -208,5 +208,52 @@ async def test_trading_commands_unavailable_without_key(env: Env) -> None:
     assert response.status_code == 503
 
 
-async def test_model_activation_not_yet_available(api: httpx.AsyncClient) -> None:
-    assert (await api.post("/api/models/v1/activate", headers=AUTH)).status_code == 501
+async def _add_model(env: Env, version: str, status: str) -> None:
+    from app.db.models import ModelVersionRecord
+
+    artifact = {
+        "metrics": {"test": {"log_loss": 0.99, "baseline_log_loss": 1.03, "policy": None}},
+        "target": {"horizon_candles": 4},
+    }
+    async with env.sm.begin() as db:
+        db.add(
+            ModelVersionRecord(
+                version=version,
+                status=status,
+                feature_set_version="v1",
+                model_sha256="0" * 64,
+                artifact_path=version,
+                artifact=artifact,
+            )
+        )
+
+
+async def test_models_list_and_activation(env: Env, api: httpx.AsyncClient) -> None:
+    await _add_model(env, "cb-test-shadow", "shadow")
+    await _add_model(env, "cb-test-candidate", "candidate")
+    items = (await api.get("/api/models", headers=AUTH)).json()["items"]
+    assert {m["version"]: m["status"] for m in items} == {
+        "cb-test-shadow": "shadow",
+        "cb-test-candidate": "candidate",
+    }
+    assert items[0]["test"]["log_loss"] == 0.99
+
+    no_confirm = await post(
+        api, "/api/models/cb-test-shadow/activate", {"reason": "без слова"}, "a1"
+    )
+    assert no_confirm.status_code == 422 and "ACTIVATE" in no_confirm.json()["detail"]
+    candidate = await post(
+        api,
+        "/api/models/cb-test-candidate/activate",
+        {"reason": "без shadow", "confirm": "ACTIVATE"},
+        "a2",
+    )
+    assert candidate.status_code == 422 and "shadow" in candidate.json()["detail"]
+    ok = await post(
+        api,
+        "/api/models/cb-test-shadow/activate",
+        {"reason": "прошла shadow", "confirm": "ACTIVATE"},
+        "a3",
+    )
+    assert ok.status_code == 200 and ok.json()["steps"] == ["cb-test-shadow: active"]
+    assert (await api.get("/api/signals", headers=AUTH)).json()["items"] == []

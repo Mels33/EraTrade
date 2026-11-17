@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     log_level: str = "info"
 
     strategy_config_path: Path = Path("config/strategy.toml")
+    models_dir: Path = Path("models")  # артефакты моделей: <models_dir>/<версия>/
 
     @field_validator("hl_account_address", mode="before")
     @classmethod

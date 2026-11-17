@@ -95,7 +95,8 @@ async def committing_sessionmaker(
     engine = create_async_engine(migrated_db, poolclass=NullPool)
     truncate = text(
         "TRUNCATE candles, market_context_snapshots, heartbeats, markets, nonce_state, "
-        "bot_state, account_snapshots, funding_events, ledger_events CASCADE"
+        "bot_state, account_snapshots, funding_events, ledger_events, signals, "
+        "feature_snapshots, model_versions CASCADE"
     )
     async with engine.begin() as conn:
         await conn.execute(truncate)

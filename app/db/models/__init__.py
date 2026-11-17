@@ -16,6 +16,7 @@ from app.db.models.market import (
     MarketContextSnapshotRecord,
     MarketRecord,
 )
+from app.db.models.models import FeatureSnapshotRecord, ModelVersionRecord, SignalRecord
 from app.db.models.reconciliation import (
     FundingEventRecord,
     LedgerEventRecord,
@@ -37,6 +38,7 @@ __all__ = [
     "AuditLogRecord",
     "BotStateRecord",
     "CandleRecord",
+    "FeatureSnapshotRecord",
     "FillRecord",
     "FundingEventRecord",
     "FundingHistoryRecord",
@@ -44,6 +46,7 @@ __all__ = [
     "LedgerEventRecord",
     "MarketContextSnapshotRecord",
     "MarketRecord",
+    "ModelVersionRecord",
     "NonceStateRecord",
     "OrderEventRecord",
     "OrderRecord",
@@ -51,4 +54,5 @@ __all__ = [
     "PositionSnapshotRecord",
     "ReconciliationDifferenceRecord",
     "ReconciliationRunRecord",
+    "SignalRecord",
 ]

@@ -5,7 +5,9 @@ import {
   AuditEntry,
   CommandResult,
   Fill,
+  ModelVersion,
   Order,
+  Signal,
   Status,
   command,
   get,
@@ -369,6 +371,71 @@ function Audit({ entries }: { entries: AuditEntry[] }) {
   );
 }
 
+const pct = (x: number | null, digits = 2) => (x === null ? "—" : `${(x * 100).toFixed(digits)}%`);
+
+function Signals({ items }: { items: Signal[] }) {
+  return (
+    <Card title="Сигналы модели" wide>
+      {items.length === 0 ? (
+        <p className="muted">Сигналов нет — модель в статусе shadow/active и команда `eratrade signal`.</p>
+      ) : (
+        <div className="scroll">
+          <table>
+            <thead><tr><th>Решение на</th><th>Модель</th><th>Решение</th><th>DOWN / FLAT / UP</th><th>E[r]</th><th>Итог</th><th>Причина</th></tr></thead>
+            <tbody>
+              {items.map((s) => (
+                <tr key={s.id} title={s.model_version}>
+                  <td>{time(s.decision_time)}</td>
+                  <td>{s.model_role}</td>
+                  <td className={`decision ${s.decision.toLowerCase()}`}>{s.decision}</td>
+                  <td>{s.probabilities ? ["DOWN", "FLAT", "UP"].map((k) => s.probabilities![k].toFixed(2)).join(" / ") : "—"}</td>
+                  <td>{s.expected_return_bps === null ? "—" : `${s.expected_return_bps.toFixed(1)} bp`}</td>
+                  <td className={s.outcome_return !== null && s.outcome_return < 0 ? "neg" : ""}>
+                    {s.outcome_return === null ? "ждёт горизонт" : `${pct(s.outcome_return)} ${s.outcome_label}`}
+                  </td>
+                  <td className="reason">{s.reason}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function Models({ items }: { items: ModelVersion[] }) {
+  return (
+    <Card title="Модели">
+      {items.length === 0 ? (
+        <p className="muted">Моделей нет — `eratrade train`.</p>
+      ) : (
+        <div className="scroll">
+          <table>
+            <thead><tr><th>Версия</th><th>Статус</th><th>test logloss</th><th>Сигналы test</th></tr></thead>
+            <tbody>
+              {items.map((m) => {
+                const pol = m.test.policy;
+                const beats = m.test.log_loss !== null && m.test.baseline_log_loss !== null && m.test.log_loss < m.test.baseline_log_loss;
+                return (
+                  <tr key={m.version}>
+                    <td title={m.version}>{m.version.slice(0, 22)}</td>
+                    <td className={`model ${m.status}`}>{m.status}</td>
+                    <td className={beats ? "pos" : "neg"} title={`baseline ${m.test.baseline_log_loss?.toFixed(4)}`}>
+                      {m.test.log_loss?.toFixed(4) ?? "—"}
+                    </td>
+                    <td>{pol ? `${pol.buy_signals + pol.sell_signals}, нетто ${pct(pol.mean_net_return)}` : "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 export default function App() {
   const [token, setTokenState] = useState(getToken());
   const [dialog, setDialog] = useState<CommandSpec | null>(null);
@@ -378,6 +445,8 @@ export default function App() {
   const orders = usePoll<Order[]>("/api/orders?limit=20", 15000, enabled);
   const fills = usePoll<Fill[]>("/api/fills?limit=20", 15000, enabled);
   const audit = usePoll<AuditEntry[]>("/api/audit?limit=20", 15000, enabled);
+  const signals = usePoll<{ items: Signal[] }>("/api/signals?limit=30", 30000, enabled);
+  const models = usePoll<{ items: ModelVersion[] }>("/api/models", 60000, enabled);
 
   const unauthorized = status.error?.includes("токен");
   if (!token || unauthorized) {
@@ -421,6 +490,8 @@ export default function App() {
         {status.data && <Health status={status.data} />}
         {account.data ? <Risk account={account.data} /> : <Card title="Риск"><p className="muted">{account.error ?? "Загрузка…"}</p></Card>}
         {account.data && <Position account={account.data} />}
+        {signals.data && <Signals items={signals.data.items} />}
+        {models.data && <Models items={models.data.items} />}
         {orders.data && <Orders orders={orders.data} />}
         {fills.data && <Fills fills={fills.data} />}
         {audit.data && <Audit entries={audit.data} />}

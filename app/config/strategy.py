@@ -102,6 +102,13 @@ class TargetConfig(_Frozen):
         return self.cost_bps + self.safety_margin_bps + self.min_edge_bps
 
 
+class SignalConfig(_Frozen):
+    """Пороги торговой политики (§15.2)."""
+
+    min_probability: Decimal = Field(gt=0, lt=1)
+    min_margin: Decimal = Field(ge=0, lt=1)
+
+
 class StrategyConfig(_Frozen):
     spec_version: int
     market: MarketConfig
@@ -113,6 +120,7 @@ class StrategyConfig(_Frozen):
     risk: RiskConfig
     dead_mans_switch: DeadMansSwitchConfig
     target: TargetConfig
+    signal: SignalConfig
 
     @model_validator(mode="after")
     def _check_cross_fields(self) -> "StrategyConfig":
