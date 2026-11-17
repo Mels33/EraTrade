@@ -17,6 +17,7 @@ SERVICE_WEIGHT_BUDGETS: dict[str, int] = {
     "collector": 200,
     "reconciler": 300,
     "trading": 600,
+    "shadow": 60,  # несколько запросов в час
 }
 
 # Базовый вес info-запросов. Всё, чего нет в таблице, — 20.

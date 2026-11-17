@@ -195,3 +195,26 @@ export interface ModelVersion {
     policy: { buy_signals: number; sell_signals: number; precision: number | null; mean_net_return: number | null } | null;
   };
 }
+
+export interface ShadowModel {
+  version: string;
+  status: string;
+  signals: number;
+  coverage: number | null;
+  decisions: Record<string, number>;
+  feature_or_model_errors: Record<string, number>;
+  probabilities: { mean: Record<string, number> | null; max_directional_p50: number | null };
+  calibration: { resolved: number; log_loss?: number; baseline_log_loss?: number; ece?: number; enough?: boolean };
+  entries: { resolved: number; precision: number | null; mean_net_return: number | null };
+  latency_s: { p50: number | null; p95: number | null };
+  market: { spread_bps_mean: number | null; entry_slippage_bps_mean: number | null };
+  risk_refusals: { count: number; reasons: Record<string, number> };
+  drift: { feature: string; shift_sigma?: number; out_of_bounds?: number }[];
+}
+
+export interface ShadowReport {
+  snapshots: number;
+  min_outcomes_for_metrics: number;
+  drift_sigma_warn: number;
+  models: ShadowModel[];
+}

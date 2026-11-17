@@ -47,6 +47,7 @@ from app.reconciliation.reconciler import (
     ReconciliationReport,
     Severity,
 )
+from app.workers.shadow import ShadowReport
 from app.workers.trader import CycleReport, TradingCycle
 
 # show_locals=False: локальные переменные (настройки, ключи) не печатаются в трейсбеке.
@@ -1474,6 +1475,163 @@ def trader_cmd(
         _with_cycle(settings, _loop, confirm_timeout)
     except KeyboardInterrupt:
         typer.echo("Остановлено оператором")
+
+
+# --- mainnet shadow (этап 13) ---
+
+
+def _print_shadow(report: "ShadowReport") -> None:
+    typer.secho(f"Shadow {report.decision_time:%Y-%m-%d %H:%M} UTC", bold=True)
+    for warning in report.warnings:
+        typer.secho(f"  ! {warning}", fg=typer.colors.YELLOW)
+    if report.signal is not None:
+        if report.signal.feature_error:
+            typer.secho(f"  {report.signal.feature_error}", fg=typer.colors.YELLOW)
+        for d in report.signal.decisions:
+            probs = (
+                " ".join(f"{k} {v:.2f}" for k, v in d.probabilities.items())
+                if d.probabilities
+                else "—"
+            )
+            typer.echo(f"  [{d.role}] {d.decision.value} · {probs}")
+    typer.echo(f"  bid {report.bid} / ask {report.ask}")
+    if report.risk_reasons:
+        typer.echo("  вход был бы отклонён: " + "; ".join(report.risk_reasons))
+
+
+@app.command("shadow")
+def shadow_cmd(
+    once: bool = typer.Option(False, "--once", help="Один проход по последней закрытой свече"),
+) -> None:
+    """Mainnet shadow: сигналы на каждую закрытую свечу с рыночными условиями и отказами risk.
+    Работает без ключа API-кошелька и никогда не подписывает ордера."""
+    from app.signals.policy import PolicyParams
+    from app.signals.service import PredictorCache
+    from app.workers.shadow import ShadowObserver
+
+    settings = _load_settings()
+    configure_logging(settings, service="shadow")
+    if settings.hl_account_address is None:
+        raise typer.BadParameter("не задан HL_ACCOUNT_ADDRESS")
+    strategy = load_strategy(settings.strategy_config_path)
+    coin, interval = strategy.market.coin, strategy.market.interval
+    step = INTERVALS[interval]
+
+    async def _run() -> None:
+        engine = create_engine(settings)
+        try:
+            sm = create_sessionmaker(engine)
+            async with open_gateway(settings, service="shadow") as gw:
+                async with sm() as session:
+                    market_id = await _market_id(session, settings, coin)
+                observer = ShadowObserver(
+                    gw,
+                    sm,
+                    strategy,
+                    PredictorCache(settings.models_dir),
+                    network=settings.network,
+                    market_id=market_id,
+                    coin=coin,
+                    user=settings.hl_account_address,  # type: ignore[arg-type]
+                    params=PolicyParams.from_strategy(strategy, step),
+                    interval=interval,
+                    step=step,
+                    clock=lambda: datetime.now(UTC),
+                )
+                if once:
+                    _print_shadow(await observer.run_once())
+                else:
+                    typer.echo("Shadow запущен: проход через 8 с после закрытия каждой свечи")
+                    await observer.run_forever(on_report=_print_shadow)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+@app.command("shadow-report")
+def shadow_report_cmd(
+    days: float = typer.Option(7, help="За сколько дней"),
+    as_json: bool = typer.Option(False, "--json", help="Вывести JSON"),
+) -> None:
+    """Отчёт shadow: покрытие, решения, калибровка по результатам, задержки, спред, дрейф."""
+    from app.signals.report import shadow_report
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin, interval = strategy.market.coin, strategy.market.interval
+
+    async def _build(session: AsyncSession) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        return await shadow_report(
+            session,
+            await _market_id(session, settings, coin),
+            since=now - timedelta(days=days),
+            now=now,
+            step=INTERVALS[interval],
+            cost_bps=float(strategy.target.cost_bps),
+        )
+
+    report = _run_in_transaction(settings, _build)
+    if as_json:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        return
+    typer.secho(f"Shadow за {days:g} дн. · снимков признаков {report['snapshots']}", bold=True)
+    if not report["models"]:
+        typer.echo("Сигналов нет — запущен ли сервис shadow-mainnet?")
+    for m in report["models"]:
+        cov = f"{m['coverage']:.0%}" if m["coverage"] is not None else "—"
+        typer.secho(f"\n{m['version']} ({m['status']})", bold=True)
+        typer.echo(f"  сигналов {m['signals']}, покрытие свечей {cov}, решения {m['decisions']}")
+        if m["feature_or_model_errors"]:
+            typer.secho(
+                f"  HOLD из-за ошибок: {m['feature_or_model_errors']}", fg=typer.colors.YELLOW
+            )
+        probs = m["probabilities"]
+        if probs["mean"]:
+            typer.echo(
+                "  средние p: "
+                + " ".join(f"{k} {v:.2f}" for k, v in probs["mean"].items())
+                + f" · max(p↑,p↓) медиана {probs['max_directional_p50']:.2f}, "
+                f"p90 {probs['max_directional_p90']:.2f}"
+            )
+        cal = m["calibration"]
+        if cal.get("log_loss") is not None:
+            note = "" if cal["enough"] else f" (мало: нужно ≥ {report['min_outcomes_for_metrics']})"
+            typer.echo(
+                f"  по результатам ({cal['resolved']}{note}): logloss {cal['log_loss']:.4f} "
+                f"против baseline {cal['baseline_log_loss']:.4f}, brier {cal['brier']:.4f}, "
+                f"ECE {cal['ece']:.3f}"
+            )
+        else:
+            typer.echo("  результатов ещё нет (горизонт 4 ч)")
+        e = m["entries"]
+        if e["resolved"]:
+            typer.echo(
+                f"  входов с результатом {e['resolved']}: precision {e['precision']:.0%}, "
+                f"среднее нетто {e['mean_net_return']:+.3%}"
+            )
+        lat, mk = m["latency_s"], m["market"]
+        if lat["p50"] is not None:
+            typer.echo(f"  задержка решения p50 {lat['p50']:.0f} с, p95 {lat['p95']:.0f} с")
+        if mk["spread_bps_mean"] is not None:
+            slip = mk["entry_slippage_bps_mean"]
+            typer.echo(
+                f"  спред средний {mk['spread_bps_mean']:.2f} bp (max {mk['spread_bps_max']:.2f}; "
+                f"заложено {strategy.target.expected_spread_bps})"
+                + (f", проскальзывание входа {slip:+.1f} bp" if slip is not None else "")
+            )
+        if m["risk_refusals"]["count"]:
+            typer.echo(f"  отказы risk/guard: {m['risk_refusals']}")
+        drift = [
+            d for d in m["drift"] if abs(d.get("shift_sigma", 0)) >= report["drift_sigma_warn"]
+        ]
+        if drift:
+            typer.secho(
+                "  дрейф признаков (≥1σ): "
+                + ", ".join(f"{d['feature']} {d['shift_sigma']:+.1f}σ" for d in drift[:6]),
+                fg=typer.colors.YELLOW,
+            )
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
@@ -12,6 +13,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -108,3 +110,12 @@ class SignalRecord(Base):
     execution_order_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("orders.id"))
     execution_started_at: Mapped[datetime | None]
     execution_finished_at: Mapped[datetime | None]
+    # Рыночные условия в момент решения (этап 13, mainnet shadow): что было бы при исполнении.
+    market_bid: Mapped[Decimal | None]
+    market_ask: Mapped[Decimal | None]
+    spread_bps: Mapped[float | None]
+    reference_price: Mapped[Decimal | None]  # close свечи решения
+    executable_price: Mapped[Decimal | None]  # ask для покупки, bid для продажи
+    entry_slippage_bps: Mapped[float | None]  # executable против reference, в худшую сторону
+    risk_reasons: Mapped[list[str] | None] = mapped_column(JSONB)
+    conditions_at: Mapped[datetime | None]

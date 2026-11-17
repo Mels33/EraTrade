@@ -7,6 +7,7 @@ import {
   Fill,
   ModelVersion,
   Order,
+  ShadowReport,
   Signal,
   Status,
   command,
@@ -436,6 +437,51 @@ function Models({ items }: { items: ModelVersion[] }) {
   );
 }
 
+function Shadow({ report }: { report: ShadowReport }) {
+  return (
+    <Card title="Shadow за 7 дней">
+      {report.models.length === 0 ? (
+        <p className="muted">Сигналов нет — сервис shadow-mainnet запущен?</p>
+      ) : (
+        report.models.map((m) => {
+          const cal = m.calibration;
+          const drift = m.drift.filter((d) => Math.abs(d.shift_sigma ?? 0) >= report.drift_sigma_warn);
+          const errors = Object.values(m.feature_or_model_errors).reduce((a, b) => a + b, 0);
+          return (
+            <div key={m.version} className="shadow-model">
+              <h3 title={m.version}>{m.version.slice(0, 26)} · {m.status}</h3>
+              <div className="kpi">
+                <div><small>сигналов</small><strong>{m.signals}</strong></div>
+                <div><small>покрытие</small><strong>{pct(m.coverage, 0)}</strong></div>
+                <div><small>ошибок → HOLD</small><strong className={errors ? "neg" : ""}>{errors}</strong></div>
+                <div><small>задержка p50</small><strong>{m.latency_s.p50 === null ? "—" : `${m.latency_s.p50.toFixed(0)} с`}</strong></div>
+              </div>
+              <p className="muted">
+                Решения: {Object.entries(m.decisions).map(([k, v]) => `${k} ${v}`).join(", ") || "—"}
+                {m.market.spread_bps_mean !== null && ` · спред ${m.market.spread_bps_mean.toFixed(2)} bp`}
+              </p>
+              <p>
+                {cal.log_loss !== undefined
+                  ? <>По результатам ({cal.resolved}{cal.enough ? "" : `, нужно ≥ ${report.min_outcomes_for_metrics}`}): logloss{" "}
+                      <span className={cal.log_loss < (cal.baseline_log_loss ?? 0) ? "pos" : "neg"}>{cal.log_loss.toFixed(3)}</span>{" "}
+                      против {cal.baseline_log_loss?.toFixed(3)}, ECE {cal.ece?.toFixed(3)}</>
+                  : <span className="muted">Результатов ещё нет (горизонт 4 ч)</span>}
+              </p>
+              {m.entries.resolved > 0 && (
+                <p>Входы: {m.entries.resolved}, precision {pct(m.entries.precision, 0)}, нетто {pct(m.entries.mean_net_return)}</p>
+              )}
+              {m.risk_refusals.count > 0 && <p className="muted">Отказы risk/guard: {m.risk_refusals.count}</p>}
+              {drift.length > 0 && (
+                <p className="warn-text">Дрейф: {drift.slice(0, 4).map((d) => `${d.feature} ${d.shift_sigma!.toFixed(1)}σ`).join(", ")}</p>
+              )}
+            </div>
+          );
+        })
+      )}
+    </Card>
+  );
+}
+
 export default function App() {
   const [token, setTokenState] = useState(getToken());
   const [dialog, setDialog] = useState<CommandSpec | null>(null);
@@ -447,6 +493,7 @@ export default function App() {
   const audit = usePoll<AuditEntry[]>("/api/audit?limit=20", 15000, enabled);
   const signals = usePoll<{ items: Signal[] }>("/api/signals?limit=30", 30000, enabled);
   const models = usePoll<{ items: ModelVersion[] }>("/api/models", 60000, enabled);
+  const shadow = usePoll<ShadowReport>("/api/shadow/report?days=7", 120000, enabled);
 
   const unauthorized = status.error?.includes("токен");
   if (!token || unauthorized) {
@@ -492,6 +539,7 @@ export default function App() {
         {account.data && <Position account={account.data} />}
         {signals.data && <Signals items={signals.data.items} />}
         {models.data && <Models items={models.data.items} />}
+        {shadow.data && <Shadow report={shadow.data} />}
         {orders.data && <Orders orders={orders.data} />}
         {fills.data && <Fills fills={fills.data} />}
         {audit.data && <Audit entries={audit.data} />}

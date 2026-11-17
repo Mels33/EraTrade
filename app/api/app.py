@@ -338,6 +338,26 @@ async def signals(ctx: Ctx, limit: Annotated[int, Query(ge=1, le=500)] = 50) -> 
     }
 
 
+@read.get("/shadow/report")
+async def shadow_report_endpoint(
+    ctx: Ctx, days: Annotated[float, Query(gt=0, le=90)] = 7
+) -> dict[str, Any]:
+    from datetime import timedelta
+
+    from app.signals.report import shadow_report
+
+    now = ctx.clock()
+    async with ctx.sm() as db:
+        return await shadow_report(
+            db,
+            ctx.market_id,
+            since=now - timedelta(days=days),
+            now=now,
+            step=INTERVALS[ctx.strategy.market.interval],
+            cost_bps=float(ctx.strategy.target.cost_bps),
+        )
+
+
 def _test_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
     test = artifact.get("metrics", {}).get("test", {})
     return {

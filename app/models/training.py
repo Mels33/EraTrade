@@ -190,6 +190,24 @@ def _bounds(train: Sequence[Sample]) -> dict[str, list[float]]:
     return result
 
 
+def _feature_stats(train: Sequence[Sample]) -> dict[str, dict[str, float]]:
+    """Распределение признаков на train: база для контроля дрейфа в shadow."""
+    stats = {}
+    for i, name in enumerate(FEATURE_NAMES):
+        values = sorted(s.features[i] for s in train)
+        n = len(values)
+        mean = math.fsum(values) / n
+        std = math.sqrt(math.fsum((v - mean) ** 2 for v in values) / max(n - 1, 1))
+        stats[name] = {
+            "mean": mean,
+            "std": std,
+            "p01": values[int(0.01 * (n - 1))],
+            "p50": values[int(0.5 * (n - 1))],
+            "p99": values[int(0.99 * (n - 1))],
+        }
+    return stats
+
+
 def _predictions(
     raw: Sequence[Sequence[float]],
     temperature: float,
@@ -272,6 +290,8 @@ def train_model(
         "feature_names": list(FEATURE_NAMES),
         "pipeline_code_sha256": pipeline_code_hash(),
         "feature_bounds": _bounds(train),
+        "feature_stats": _feature_stats(train),
+        "train_class_distribution": class_distribution(train_labels),
         "target": manifest["target"],
         "market": manifest["market"],
         "training_period": {

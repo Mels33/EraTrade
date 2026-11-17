@@ -60,6 +60,29 @@ services:
       driver: json-file
       options: {max-size: "20m", max-file: "5"}
 
+  # Mainnet shadow (§16.4): сигналы на каждую закрытую свечу без ключа API-кошелька.
+  # Артефакты моделей — из ./models (только чтение).
+  shadow-mainnet:
+    build: .
+    container_name: eratrade-shadow-mainnet
+    profiles: ["collector"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env.mainnet
+    environment:
+      DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
+      ERATRADE_ENV_FILE: /nonexistent
+      MODELS_DIR: /app/models
+    volumes:
+      - ./models:/app/models:ro
+    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade shadow"]
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
   # API и панель управления (§13). Порт опубликован только на 127.0.0.1.
   # Ключ API-кошелька нужен только для cancel-all/flatten/kill; открыть позицию через API нельзя.
   api-mainnet:

@@ -257,3 +257,9 @@ async def test_models_list_and_activation(env: Env, api: httpx.AsyncClient) -> N
     )
     assert ok.status_code == 200 and ok.json()["steps"] == ["cb-test-shadow: active"]
     assert (await api.get("/api/signals", headers=AUTH)).json()["items"] == []
+
+
+async def test_shadow_report_endpoint(api: httpx.AsyncClient) -> None:
+    body = (await api.get("/api/shadow/report?days=3", headers=AUTH)).json()
+    assert body["models"] == [] and "snapshots" in body
+    assert (await api.get("/api/shadow/report?days=0", headers=AUTH)).status_code == 422
