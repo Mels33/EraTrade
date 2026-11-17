@@ -7,8 +7,10 @@ import {
   Fill,
   ModelVersion,
   Order,
+  Readiness,
   ShadowReport,
   Signal,
+  Trade,
   Status,
   command,
   get,
@@ -482,6 +484,58 @@ function Shadow({ report }: { report: ShadowReport }) {
   );
 }
 
+const TONE = { ok: "ok", warn: "warn", fail: "bad" } as const;
+const VERDICT = { ok: "можно включать live", warn: "можно, разберите предупреждения", fail: "live включать нельзя" };
+
+function ReadinessCard({ data }: { data: Readiness }) {
+  return (
+    <Card title="Готовность к live (§17.1)">
+      <p><Dot tone={TONE[data.summary]} /><strong>{VERDICT[data.summary]}</strong></p>
+      <table>
+        <tbody>
+          {data.checks.map((c) => (
+            <tr key={c.name}>
+              <td><Dot tone={TONE[c.status]} />{c.name}</td>
+              <td className="reason">{c.detail}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Card>
+  );
+}
+
+function Trades({ items }: { items: Trade[] }) {
+  return (
+    <Card title="Сделки (разбор §17.2)" wide>
+      {items.length === 0 ? <p className="muted">Сделок нет</p> : (
+        <div className="scroll">
+          <table>
+            <thead><tr><th>Открыта</th><th>Сторона</th><th>Номинал</th><th>Вход → выход</th><th>Выход</th><th>Комиссии</th><th>Нетто</th><th>Проверки</th></tr></thead>
+            <tbody>
+              {items.map((t) => (
+                <tr key={t.opened_at}>
+                  <td>{time(t.opened_at)}</td>
+                  <td>{t.side}</td>
+                  <td>{t.notional}</td>
+                  <td>{fmt(t.entry_price, 1)} → {t.exit_price ? fmt(t.exit_price, 1) : "—"}</td>
+                  <td>{t.exit_kind ?? "открыта"}</td>
+                  <td>{fmt(t.fees, 4)}</td>
+                  <td className={num(t.net) < 0 ? "neg" : "pos"}>{fmt(t.net, 4)}</td>
+                  <td className="reason">
+                    {t.checks.length ? <span className="neg">{t.checks.join("; ")}</span> : t.bot_entry ? "✓" : ""}
+                    {t.notes.length > 0 && ` ${t.notes.join("; ")}`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 export default function App() {
   const [token, setTokenState] = useState(getToken());
   const [dialog, setDialog] = useState<CommandSpec | null>(null);
@@ -494,6 +548,8 @@ export default function App() {
   const signals = usePoll<{ items: Signal[] }>("/api/signals?limit=30", 30000, enabled);
   const models = usePoll<{ items: ModelVersion[] }>("/api/models", 60000, enabled);
   const shadow = usePoll<ShadowReport>("/api/shadow/report?days=7", 120000, enabled);
+  const ready = usePoll<Readiness>("/api/live/readiness", 120000, enabled);
+  const trades = usePoll<Trade[]>("/api/trades?limit=20", 60000, enabled);
 
   const unauthorized = status.error?.includes("токен");
   if (!token || unauthorized) {
@@ -540,6 +596,8 @@ export default function App() {
         {signals.data && <Signals items={signals.data.items} />}
         {models.data && <Models items={models.data.items} />}
         {shadow.data && <Shadow report={shadow.data} />}
+        {ready.data && <ReadinessCard data={ready.data} />}
+        {trades.data && <Trades items={trades.data} />}
         {orders.data && <Orders orders={orders.data} />}
         {fills.data && <Fills fills={fills.data} />}
         {audit.data && <Audit entries={audit.data} />}

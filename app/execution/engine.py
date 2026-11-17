@@ -362,6 +362,13 @@ class ExecutionEngine:
         snap = await self._snapshot()
         risk_snap = await self.risk.snapshot()
         reasons = [*self.risk.entry_blocks(risk_snap), *self._guard(proposed, snap).reasons]
+        moved_bps = abs(snap.book.mid - mid) / mid * 10_000
+        if moved_bps > self.strategy.limits.max_slippage_bps:
+            # Размер и стоп считались по цене превью — при сильном сдвиге они уже неверны.
+            reasons.append(
+                f"рынок сдвинулся на {moved_bps:.1f} bps после превью "
+                f"(лимит {self.strategy.limits.max_slippage_bps})"
+            )
         if reasons:
             return TradeResult(await self._block(order, tuple(reasons)))
 

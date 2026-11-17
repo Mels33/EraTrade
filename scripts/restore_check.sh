@@ -14,3 +14,6 @@ docker exec -i "$CONTAINER" pg_restore -U eratrade --exit-on-error -d "$TMP_DB" 
 TABLES=$(docker exec "$CONTAINER" psql -U eratrade -d "$TMP_DB" -tAc \
   "select count(*) from information_schema.tables where table_schema='public'")
 echo "restore OK: $TABLES таблиц в public"
+# Журнал для `eratrade live-check` (проверка восстановления не старше N дней).
+LOG_DIR="$(cd "$(dirname "$DUMP")" && pwd)"
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) OK $(basename "$DUMP") tables=$TABLES" >>"$LOG_DIR/restore_checks.log"

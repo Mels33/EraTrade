@@ -76,3 +76,14 @@ min_probability = "0.45"   # p(UP) для BUY / p(DOWN) для SELL не ниж�
 min_margin = "0.15"        # p(UP) − p(DOWN) для BUY (и наоборот для SELL) не ниже
 # Ожидаемая доходность E[r] = Σ p(класс) × средняя доходность класса на train
 # должна превышать target.cost_bps + target.safety_margin_bps.
+
+[live]
+# Требования перед живой торговлей (этап 14, docs/runbook.md). Проверяет `eratrade live-check`,
+# активация модели без этих доказательств из shadow запрещена.
+min_shadow_outcomes = 50          # сигналов модели с наступившим горизонтом
+max_shadow_error_rate = "0.05"    # доля HOLD из-за ошибок данных/модели
+min_shadow_coverage = "0.95"      # доля закрытых свечей с сигналом
+require_beats_baseline = true     # log loss по результатам shadow лучше априорного
+max_backup_age_hours = 26
+max_restore_check_age_days = 7
+min_wallet_valid_days = 14

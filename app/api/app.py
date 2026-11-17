@@ -4,6 +4,7 @@
 """
 
 import hmac
+import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -31,9 +32,11 @@ from app.execution import emergency
 from app.execution.engine import OrderPreview
 from app.execution.lock import AnotherTraderRunningError
 from app.integrations.hyperliquid.gateway import INTERVALS
+from app.live.evidence import shadow_evidence
 from app.market_data.collector import COMPONENT as COLLECTOR
 
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+BACKUPS_DIR = Path(os.environ.get("ERATRADE_BACKUPS_DIR", "backups"))
 API_ACTOR = Actor(ActorKind.OPERATOR, "api")
 
 
@@ -358,6 +361,37 @@ async def shadow_report_endpoint(
         )
 
 
+@read.get("/live/readiness")
+async def live_readiness(ctx: Ctx) -> dict[str, Any]:
+    from app.live.readiness import readiness, summary
+
+    checks = await ctx.cache.get(
+        "readiness",
+        lambda: readiness(
+            ctx.settings,
+            ctx.strategy,
+            ctx.sm,
+            ctx.gateway,
+            market_id=ctx.market_id,
+            backups_dir=BACKUPS_DIR,
+            now=ctx.clock(),
+        ),
+    )
+    return {
+        "summary": summary(checks).value,
+        "checks": [{"name": c.name, "status": c.status.value, "detail": c.detail} for c in checks],
+    }
+
+
+@read.get("/trades")
+async def trades(ctx: Ctx, limit: Annotated[int, Query(ge=1, le=200)] = 20) -> list[dict[str, Any]]:
+    from app.live.review import round_trips
+
+    async with ctx.sm() as db:
+        result = await round_trips(db, ctx.market_id, ctx.strategy)
+    return [t.as_dict() for t in result[-limit:]][::-1]
+
+
 def _test_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
     test = artifact.get("metrics", {}).get("test", {})
     return {
@@ -554,6 +588,22 @@ async def activate_model(
     async def run() -> dict[str, Any]:
         _require_confirm(body, "ACTIVATE")
         async with ctx.sm.begin() as db:
+            current = await models_repo.get_model(db, version)
+            rollback = current.status == "retired" and current.activated_at is not None
+            if not rollback:
+                evidence = await shadow_evidence(
+                    db,
+                    current,
+                    ctx.strategy.live,
+                    now=ctx.clock(),
+                    step=INTERVALS[ctx.strategy.market.interval],
+                    cost_bps=float(ctx.strategy.target.cost_bps),
+                )
+                if not evidence.ok:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="доказательств shadow недостаточно: " + "; ".join(evidence.failures),
+                    )
             record = await models_repo.activate(db, version, actor=actor, reason=body.reason)
         return {"steps": [f"{record.version}: {record.status}"]}
 

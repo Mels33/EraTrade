@@ -97,6 +97,9 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
       ERATRADE_ENV_FILE: /nonexistent
+      ERATRADE_BACKUPS_DIR: /backups
+    volumes:
+      - ./backups:/backups:ro  # для проверки готовности (возраст бэкапа и проверки восстановления)
     ports:
       - "127.0.0.1:8000:8000"
     entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade api --host 0.0.0.0 --allow-external"]

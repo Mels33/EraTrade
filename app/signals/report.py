@@ -53,7 +53,7 @@ def _error_kind(reason: str) -> str:
     return text.split(":")[0].strip()[:60] or "другое"
 
 
-def _model_section(
+def model_section(
     model: ModelVersionRecord,
     signals: Sequence[SignalRecord],
     *,
@@ -223,7 +223,7 @@ async def shadow_report(
         model_signals = [s for s in signals if s.model_version == version]
         start = model_signals[0].decision_time
         expected = int((now - start) // step) + 1
-        section = _model_section(
+        section = model_section(
             models[version], model_signals, cost=cost_bps / 10_000, expected_candles=expected
         )
         section["drift"] = _drift(models[version], snapshots)

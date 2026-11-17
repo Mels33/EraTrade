@@ -218,3 +218,26 @@ export interface ShadowReport {
   drift_sigma_warn: number;
   models: ShadowModel[];
 }
+
+export interface Readiness {
+  summary: "ok" | "warn" | "fail";
+  checks: { name: string; status: "ok" | "warn" | "fail"; detail: string }[];
+}
+
+export interface Trade {
+  side: string;
+  opened_at: string;
+  closed_at: string | null;
+  size: string;
+  notional: string;
+  entry_price: string;
+  exit_price: string | null;
+  fees: string;
+  funding: string;
+  net: string;
+  exit_kind: string | null;
+  bot_entry: boolean;
+  checks: string[];
+  notes: string[];
+  entry_slippage_vs_preview_bps: number | null;
+}

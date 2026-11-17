@@ -109,6 +109,18 @@ class SignalConfig(_Frozen):
     min_margin: Decimal = Field(ge=0, lt=1)
 
 
+class LiveConfig(_Frozen):
+    """Требования к shadow-доказательствам и эксплуатации перед live (этап 14)."""
+
+    min_shadow_outcomes: int = Field(ge=1)
+    max_shadow_error_rate: Decimal = Field(ge=0, le=1)
+    min_shadow_coverage: Decimal = Field(ge=0, le=1)
+    require_beats_baseline: bool
+    max_backup_age_hours: int = Field(gt=0)
+    max_restore_check_age_days: int = Field(gt=0)
+    min_wallet_valid_days: int = Field(ge=0)
+
+
 class StrategyConfig(_Frozen):
     spec_version: int
     market: MarketConfig
@@ -121,6 +133,7 @@ class StrategyConfig(_Frozen):
     dead_mans_switch: DeadMansSwitchConfig
     target: TargetConfig
     signal: SignalConfig
+    live: LiveConfig
 
     @model_validator(mode="after")
     def _check_cross_fields(self) -> "StrategyConfig":

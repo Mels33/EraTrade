@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -208,7 +209,9 @@ async def test_trading_commands_unavailable_without_key(env: Env) -> None:
     assert response.status_code == 503
 
 
-async def _add_model(env: Env, version: str, status: str) -> None:
+async def _add_model(env: Env, version: str, status: str, *, was_active: bool = False) -> None:
+    from datetime import UTC, datetime
+
     from app.db.models import ModelVersionRecord
 
     artifact = {
@@ -224,6 +227,7 @@ async def _add_model(env: Env, version: str, status: str) -> None:
                 model_sha256="0" * 64,
                 artifact_path=version,
                 artifact=artifact,
+                activated_at=datetime(2026, 11, 1, tzinfo=UTC) if was_active else None,
             )
         )
 
@@ -231,10 +235,12 @@ async def _add_model(env: Env, version: str, status: str) -> None:
 async def test_models_list_and_activation(env: Env, api: httpx.AsyncClient) -> None:
     await _add_model(env, "cb-test-shadow", "shadow")
     await _add_model(env, "cb-test-candidate", "candidate")
+    await _add_model(env, "cb-test-old", "retired", was_active=True)
     items = (await api.get("/api/models", headers=AUTH)).json()["items"]
     assert {m["version"]: m["status"] for m in items} == {
         "cb-test-shadow": "shadow",
         "cb-test-candidate": "candidate",
+        "cb-test-old": "retired",
     }
     assert items[0]["test"]["log_loss"] == 0.99
 
@@ -242,20 +248,22 @@ async def test_models_list_and_activation(env: Env, api: httpx.AsyncClient) -> N
         api, "/api/models/cb-test-shadow/activate", {"reason": "без слова"}, "a1"
     )
     assert no_confirm.status_code == 422 and "ACTIVATE" in no_confirm.json()["detail"]
-    candidate = await post(
-        api,
-        "/api/models/cb-test-candidate/activate",
-        {"reason": "без shadow", "confirm": "ACTIVATE"},
-        "a2",
-    )
-    assert candidate.status_code == 422 and "shadow" in candidate.json()["detail"]
-    ok = await post(
+    # shadow без накопленных сигналов — доказательств нет, активировать нельзя
+    no_evidence = await post(
         api,
         "/api/models/cb-test-shadow/activate",
-        {"reason": "прошла shadow", "confirm": "ACTIVATE"},
+        {"reason": "рано", "confirm": "ACTIVATE"},
+        "a2",
+    )
+    assert no_evidence.status_code == 422 and "доказательств" in no_evidence.json()["detail"]
+    # откат на прежнюю активную модель доказательств не требует
+    rollback = await post(
+        api,
+        "/api/models/cb-test-old/activate",
+        {"reason": "откат", "confirm": "ACTIVATE"},
         "a3",
     )
-    assert ok.status_code == 200 and ok.json()["steps"] == ["cb-test-shadow: active"]
+    assert rollback.status_code == 200 and rollback.json()["steps"] == ["cb-test-old: active"]
     assert (await api.get("/api/signals", headers=AUTH)).json()["items"] == []
 
 
@@ -263,3 +271,14 @@ async def test_shadow_report_endpoint(api: httpx.AsyncClient) -> None:
     body = (await api.get("/api/shadow/report?days=3", headers=AUTH)).json()
     assert body["models"] == [] and "snapshots" in body
     assert (await api.get("/api/shadow/report?days=0", headers=AUTH)).status_code == 422
+
+
+async def test_live_readiness_and_trades_endpoints(env: Env, api: httpx.AsyncClient) -> None:
+    body = (await api.get("/api/live/readiness", headers=AUTH)).json()
+    assert body["summary"] == "fail"  # testnet, нет активной модели и т.д.
+    assert {c["name"] for c in body["checks"]} >= {"сеть", "активная модель", "бэкап БД"}
+
+    await env.engine.open_position(Side.BUY, Decimal("15"), confirm=env.yes)
+    await env.engine.sync_fills(env.clock() - timedelta(hours=1))
+    trades = (await api.get("/api/trades", headers=AUTH)).json()
+    assert trades[0]["side"] == "long" and trades[0]["notes"] == ["позиция открыта"]

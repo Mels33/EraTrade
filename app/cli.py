@@ -1235,6 +1235,33 @@ def models_cmd() -> None:
     _run_in_transaction(settings, _list)
 
 
+def _activation_failures(settings: Settings, version: str) -> list[str]:
+    """Пустой список — можно активировать. Откат на прежнюю активную доказательств не требует."""
+    from app.db.repositories import models as models_repo
+    from app.live.evidence import shadow_evidence
+
+    strategy = load_strategy(settings.strategy_config_path)
+
+    async def _check(session: AsyncSession) -> list[str]:
+        try:
+            record = await models_repo.get_model(session, version)
+        except models_repo.RegistryError as exc:
+            return [str(exc)]
+        if record.status == "retired" and record.activated_at is not None:
+            return []
+        evidence = await shadow_evidence(
+            session,
+            record,
+            strategy.live,
+            now=datetime.now(UTC),
+            step=INTERVALS[strategy.market.interval],
+            cost_bps=float(strategy.target.cost_bps),
+        )
+        return evidence.failures
+
+    return _run_in_transaction(settings, _check)
+
+
 def _model_transition(version: str, reason: str, action: str) -> None:
     from app.db.repositories import models as models_repo
 
@@ -1270,8 +1297,23 @@ def model_activate_cmd(
     version: str,
     reason: str = typer.Option(..., help="Причина (в аудит)"),
     yes: bool = typer.Option(False, "--yes", help="Без интерактивного подтверждения"),
+    without_evidence: bool = typer.Option(
+        False, "--without-evidence", help="Активировать, хотя доказательств shadow недостаточно"
+    ),
 ) -> None:
-    """Сделать модель активной (только после shadow или откат на прежнюю активную)."""
+    """Сделать модель активной: только после shadow с достаточными доказательствами
+    ([live] в strategy.toml) или откат на прежнюю активную."""
+    settings = _load_settings()
+    failures = _activation_failures(settings, version)
+    if failures:
+        typer.secho("Доказательств из shadow недостаточно:", fg=typer.colors.RED)
+        for f in failures:
+            typer.echo(f"  - {f}")
+        if not without_evidence:
+            typer.echo("Активация отменена (--without-evidence — только осознанно, с причиной).")
+            raise typer.Exit(code=1)
+        typer.secho("Активация БЕЗ доказательств — по решению оператора", fg=typer.colors.YELLOW)
+        reason = f"{reason} [без доказательств shadow: {'; '.join(failures)}]"
     if not yes:
         typer.confirm(
             f"Активировать {version}? Её сигналы будут использоваться для торговли", abort=True
@@ -1632,6 +1674,105 @@ def shadow_report_cmd(
                 + ", ".join(f"{d['feature']} {d['shift_sigma']:+.1f}σ" for d in drift[:6]),
                 fg=typer.colors.YELLOW,
             )
+
+
+# --- живая торговля (этап 14) ---
+
+
+@app.command("live-check")
+def live_check_cmd(
+    backups: str = typer.Option("backups", help="Каталог бэкапов"),
+) -> None:
+    """Готовность к живой торговле (§17.1): чек-лист. Код выхода 1, если есть FAIL."""
+    from pathlib import Path
+
+    from app.live.readiness import CheckStatus, readiness, summary
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin = strategy.market.coin
+
+    async def _run() -> list:  # type: ignore[type-arg]
+        engine = create_engine(settings)
+        try:
+            sm = create_sessionmaker(engine)
+            async with sm() as session:
+                market_id = await _market_id(session, settings, coin)
+            async with open_gateway(settings) as gw:
+                return await readiness(
+                    settings,
+                    strategy,
+                    sm,
+                    gw,
+                    market_id=market_id,
+                    backups_dir=Path(backups),
+                    now=datetime.now(UTC),
+                )
+        finally:
+            await engine.dispose()
+
+    checks = asyncio.run(_run())
+    marks = {
+        CheckStatus.OK: ("OK  ", typer.colors.GREEN),
+        CheckStatus.WARN: ("WARN", typer.colors.YELLOW),
+        CheckStatus.FAIL: ("FAIL", typer.colors.RED),
+    }
+    typer.secho(f"Готовность к live · {settings.network.value.upper()}", bold=True)
+    for c in checks:
+        mark, color = marks[c.status]
+        typer.secho(f"  [{mark}] {c.name:<36} {c.detail}", fg=color)
+    total = summary(checks)
+    verdict = {
+        CheckStatus.OK: "можно включать live с ручным подтверждением",
+        CheckStatus.WARN: "можно, но разберите предупреждения",
+        CheckStatus.FAIL: "live включать НЕЛЬЗЯ",
+    }[total]
+    typer.secho(f"Итог: {verdict}", fg=marks[total][1], bold=True)
+    if total is CheckStatus.FAIL:
+        raise typer.Exit(code=1)
+
+
+@app.command("trades")
+def trades_cmd(limit: int = typer.Option(20, help="Сколько последних сделок")) -> None:
+    """Разбор сделок (§17.2): размер, стоп, fills, комиссии, funding, результат."""
+    from app.live.review import round_trips
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+
+    async def _list(session: AsyncSession) -> None:
+        trips = await round_trips(
+            session, await _market_id(session, settings, strategy.market.coin), strategy
+        )
+        if not trips:
+            typer.echo("Сделок нет")
+        for t in trips[-limit:]:
+            closed = f"{t.closed_at:%m-%d %H:%M}" if t.closed_at else "открыта"
+            exit_price = f"{t.exit_price:.1f}" if t.exit_price else "—"
+            typer.secho(
+                f"{t.opened_at:%m-%d %H:%M} → {closed}  {t.side:<5} {t.size} "
+                f"({t.notional:.2f} USDC)  {t.entry_price:.1f} → {exit_price}  "
+                f"выход: {t.exit_kind or '—'}",
+                bold=True,
+            )
+            slip = []
+            if t.entry_slippage_vs_preview_bps is not None:
+                slip.append(f"к превью {t.entry_slippage_vs_preview_bps:+.1f} bp")
+            if t.entry_slippage_vs_signal_bps is not None:
+                slip.append(f"к close сигнала {t.entry_slippage_vs_signal_bps:+.1f} bp")
+            typer.echo(
+                f"  PnL биржи {t.realized_pnl:+.4f}, комиссии {t.fees:.4f}, funding "
+                f"{t.funding:+.4f} → нетто {t.net:+.4f} USDC"
+                + (f"; проскальзывание входа: {', '.join(slip)}" if slip else "")
+            )
+            for check in t.checks:
+                typer.secho(f"  ✗ {check}", fg=typer.colors.RED)
+            for note in t.notes:
+                typer.echo(f"  · {note}")
+            if t.bot_entry and not t.checks:
+                typer.secho("  ✓ размер и стоп в порядке", fg=typer.colors.GREEN)
+
+    _run_in_transaction(settings, _list)
 
 
 if __name__ == "__main__":
