@@ -30,6 +30,7 @@ from app.domain.account import Side
 from app.domain.control import Actor, ActorKind, TransitionError
 from app.domain.instruments import InstrumentRules, Rounding
 from app.domain.orders import OrderStatus
+from app.execution import emergency
 from app.execution.engine import ExecutionEngine, OrderPreview, TradeResult
 from app.execution.session import TradingSession, open_trading_session
 from app.integrations.hyperliquid import actions as hl_actions
@@ -39,6 +40,7 @@ from app.market_data.collector import CollectorConfig, MarketDataCollector, floo
 from app.market_data.gaps import compress_ranges
 from app.market_data.metadata import sync_market
 from app.observability.logging import configure_logging, correlation_scope
+from app.observability.notify import build_notifier
 from app.reconciliation.reconciler import (
     Reconciler,
     ReconciliationReport,
@@ -304,7 +306,7 @@ def collect() -> None:
                 loop.add_signal_handler(sig, task.cancel)
         engine = create_engine(settings)
         try:
-            async with open_gateway(settings) as gw:
+            async with open_gateway(settings, service="collector") as gw:
                 collector = MarketDataCollector(
                     gw, create_sessionmaker(engine), settings.hyperliquid_ws_url, config
                 )
@@ -513,7 +515,11 @@ async def _with_engine[T](settings: Settings, fn: Callable[[ExecutionEngine], Aw
 
     async def _run(session: TradingSession, gw: HyperliquidGateway) -> T:
         engine = await ExecutionEngine.create(
-            session, gw, create_sessionmaker(create_engine(settings)), strategy
+            session,
+            gw,
+            create_sessionmaker(create_engine(settings)),
+            strategy,
+            notifier=build_notifier(settings),
         )
         with correlation_scope():
             return await fn(engine)
@@ -538,6 +544,11 @@ def _make_confirm(settings: Settings) -> Callable[[OrderPreview], Awaitable[bool
             typer.echo(
                 f"stop-market reduceOnly: срабатывание {p.stop_trigger}, "
                 f"убыток до стопа ≈ {p.max_loss_at_stop:.2f} USDC (без проскальзывания)"
+            )
+        if p.risk_amount is not None:
+            typer.echo(
+                f"риск на сделку {p.risk_amount:.4f} USDC; размер ограничен: "
+                + ", ".join(p.sizing_limited_by)
             )
         return typer.confirm("Отправить ордер?", default=False)
 
@@ -594,6 +605,8 @@ async def _pre_trade_reconcile(engine: ExecutionEngine) -> ReconciliationReport:
         market_id=engine.market_id,
         coin=engine.coin,
         user=engine.user,
+        risk=engine.risk,
+        notifier=engine.notifier,
     )
     report = await reconciler.run("pre_trade")
     _print_report(report)
@@ -606,9 +619,13 @@ async def _with_reconciler[T](settings: Settings, fn: Callable[[Reconciler], Awa
     strategy = load_strategy(settings.strategy_config_path)
     engine = create_engine(settings)
     try:
-        async with open_gateway(settings) as gw:
+        async with open_gateway(settings, service="reconciler") as gw:
             reconciler = await Reconciler.create(
-                gw, create_sessionmaker(engine), strategy, user=settings.hl_account_address
+                gw,
+                create_sessionmaker(engine),
+                strategy,
+                user=settings.hl_account_address,
+                notifier=build_notifier(settings),
             )
             return await fn(reconciler)
     finally:
@@ -673,10 +690,152 @@ def unblock(
         typer.echo("Запрета не было")
 
 
+@app.command("notify-test")
+def notify_test() -> None:
+    """Отправить тестовое уведомление оператору (Telegram или лог)."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+    notifier = build_notifier(settings)
+    ok = asyncio.run(notifier.send("тестовое уведомление: канал оповещений работает ✅"))
+    channel = type(notifier).__name__
+    if ok:
+        typer.secho(f"OK: отправлено через {channel}", fg=typer.colors.GREEN)
+    else:
+        typer.secho(
+            f"НЕ отправлено через {channel} — проверьте токен и chat_id", fg=typer.colors.RED
+        )
+        raise typer.Exit(code=1)
+
+
+@app.command("risk-status")
+def risk_status() -> None:
+    """Equity, PnL дня и недели, лимиты убытка и сделок. Ключ не нужен."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+
+    async def _status(reconciler: Reconciler) -> None:
+        risk = reconciler.risk
+        assert risk is not None  # noqa: S101 — Reconciler.create всегда создаёт risk engine
+        snap = await risk.snapshot()
+        limits = risk.strategy.limits
+        typer.echo(
+            f"Equity {snap.equity:.2f} USDC (spot {snap.spot_usdc:.2f} + perp "
+            f"{snap.perp_account_value:.2f}), нереализованный PnL {snap.unrealized_pnl:.4f}"
+        )
+        typer.echo(
+            f"День: PnL {snap.daily_pnl:+.4f} (закрыто {snap.realized_today:+.4f}, комиссии "
+            f"{snap.fees_today:.4f}, funding {snap.funding_today:+.4f}); лимит "
+            f"−{snap.daily_base * limits.max_daily_loss_fraction:.2f}"
+        )
+        typer.echo(
+            f"Неделя: PnL {snap.weekly_pnl:+.4f}; лимит "
+            f"−{snap.weekly_base * limits.max_weekly_loss_fraction:.2f}"
+        )
+        typer.echo(f"Сделок сегодня: {snap.trades_today} из {limits.max_trades_per_day}")
+        blocks = risk.entry_blocks(snap)
+        for block in blocks:
+            typer.secho(f"✖ {block}", fg=typer.colors.RED)
+        if not blocks:
+            typer.secho("Лимиты риска не нарушены", fg=typer.colors.GREEN)
+
+    asyncio.run(_with_reconciler(settings, _status))
+
+
+@app.command("pause")
+def pause_cmd(
+    reason: str = typer.Option(..., "--reason", "-r", help="Причина (попадёт в аудит)"),
+) -> None:
+    """PAUSE: запретить новые входы (LIVE_ENABLED → LIVE_PAUSED). Ключ не нужен."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+
+    async def _pause() -> list[str]:
+        engine = create_engine(settings)
+        try:
+            return await emergency.pause(
+                create_sessionmaker(engine),
+                settings.network,
+                actor=_operator(),
+                reason=reason,
+                notifier=build_notifier(settings),
+            )
+        finally:
+            await engine.dispose()
+
+    for step in asyncio.run(_pause()):
+        typer.echo(step)
+
+
+def _print_emergency(result: emergency.EmergencyResult) -> None:
+    for step in result.steps:
+        typer.echo(f"· {step}")
+    for warning in result.warnings:
+        typer.secho(f"! {warning}", fg=typer.colors.RED, bold=True)
+
+
+def _emergency_confirm(settings: Settings, yes: bool) -> Callable[[OrderPreview], Awaitable[bool]]:
+    async def auto_yes(preview: OrderPreview) -> bool:
+        return True
+
+    return auto_yes if yes else _make_confirm(settings)
+
+
+@app.command("cancel-all")
+def cancel_all_cmd(
+    reason: str = typer.Option(..., "--reason", "-r"),
+    yes: bool = typer.Option(False, "--yes", help="Без вопроса"),
+) -> None:
+    """CANCEL_ALL: отменить все открытые ордера инструмента (включая защитные стопы!)."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+    if not yes and not typer.confirm("Отменить ВСЕ открытые ордера, включая стопы?"):
+        raise typer.Exit(code=1)
+
+    async def _run(engine: ExecutionEngine) -> emergency.EmergencyResult:
+        return await emergency.cancel_all(engine, actor=_operator(), reason=reason)
+
+    _print_emergency(asyncio.run(_with_engine(settings, _run)))
+
+
+@app.command("flatten")
+def flatten_cmd(yes: bool = typer.Option(False, "--yes", help="Без подтверждения ордера")) -> None:
+    """FLATTEN: закрыть позицию reduceOnly-ордером и снять стопы."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+
+    async def _run(engine: ExecutionEngine) -> emergency.EmergencyResult:
+        return await emergency.flatten(engine, confirm=_emergency_confirm(settings, yes))
+
+    _print_emergency(asyncio.run(_with_engine(settings, _run)))
+
+
+@app.command("kill")
+def kill_cmd(
+    reason: str = typer.Option(..., "--reason", "-r"),
+    yes: bool = typer.Option(False, "--yes", help="Без подтверждений"),
+) -> None:
+    """FULL_KILL: пауза → закрыть позицию → отменить ордера → режим DISABLED."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+    if not yes and not typer.confirm(
+        "FULL KILL: закрыть позицию, отменить ордера, выключить бота?"
+    ):
+        raise typer.Exit(code=1)
+
+    async def _run(engine: ExecutionEngine) -> emergency.EmergencyResult:
+        return await emergency.full_kill(
+            engine, actor=_operator(), reason=reason, confirm=_emergency_confirm(settings, True)
+        )
+
+    _print_emergency(asyncio.run(_with_engine(settings, _run)))
+
+
 @app.command("open")
 def open_position(
     direction: str = typer.Argument(..., help="long или short"),
-    notional: Decimal = typer.Option(..., help="Номинал в USDC (лимит — в config/strategy.toml)"),
+    notional: Decimal | None = typer.Option(
+        None, help="Верхняя граница номинала, USDC (по умолчанию — размер от риска до стопа)"
+    ),
     stop_price: Decimal | None = typer.Option(None, help="Цена стопа (по умолчанию из ATR)"),
 ) -> None:
     """Открыть позицию IOC-ордером и поставить биржевой stop-market (с подтверждением)."""

@@ -44,3 +44,17 @@ max_unknown_order_seconds = 30
 stop_market_slippage_bps = "500"
 # Каждый ордер подтверждается оператором вручную (этапы 6–8, решение без testnet).
 require_manual_confirmation = true
+
+[risk]
+# Нереализованный PnL открытой позиции входит в дневной/недельный убыток (консервативно, §12.3).
+loss_includes_unrealized = true
+# Предупреждение, когда у адреса остаётся мало запросов (address-based rate limit).
+address_requests_warning = 1000
+
+[dead_mans_switch]
+# scheduleCancel отменяет ВСЕ открытые ордера, а у нас единственные стоящие ордера — защитные
+# стопы (входы — IOC). Включённый switch при падении бота снял бы защиту с позиции, поэтому
+# по умолчанию выключен. Имеет смысл, только если появятся лимитные входы (GTC/ALO).
+enabled = false
+horizon_seconds = 120
+refresh_seconds = 30

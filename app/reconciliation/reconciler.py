@@ -37,6 +37,8 @@ from app.domain.orders import OrderStatus
 from app.execution.tracker import OrderTracker
 from app.integrations.hyperliquid.gateway import HyperliquidGateway
 from app.market_data.metadata import sync_market
+from app.observability.notify import LogNotifier, Notifier
+from app.risk.engine import RiskEngine
 
 RECONCILER_ACTOR = Actor(ActorKind.SYSTEM, "reconciler")
 COMPONENT = "reconciler"
@@ -64,6 +66,8 @@ class DiffKind(StrEnum):
     LOCAL_STOP_MISSING = "local_stop_missing"
     UNPROTECTED_POSITION = "unprotected_position"
     UNDERSIZED_STOP = "undersized_stop"
+    LOSS_LIMIT = "loss_limit"
+    ADDRESS_RATE_LIMIT = "address_rate_limit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +117,8 @@ class Reconciler:
         fill_lookback: timedelta = timedelta(hours=24),
         events_lookback: timedelta = timedelta(days=7),
         abandon_after: timedelta = timedelta(minutes=5),
+        risk: RiskEngine | None = None,
+        notifier: Notifier | None = None,
     ) -> None:
         self.gateway = gateway
         self.sm = sessionmaker
@@ -125,6 +131,8 @@ class Reconciler:
         self.fill_lookback = fill_lookback
         self.events_lookback = events_lookback
         self.abandon_after = abandon_after
+        self.risk = risk
+        self.notifier = notifier or LogNotifier()
         self.instance_id = uuid.uuid4().hex[:12]
         self.started_at = clock()
 
@@ -136,6 +144,7 @@ class Reconciler:
         strategy: StrategyConfig,
         *,
         user: str,
+        notifier: Notifier | None = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> "Reconciler":
         async with sessionmaker.begin() as db:
@@ -149,6 +158,17 @@ class Reconciler:
             max_unknown_seconds=strategy.freshness.max_unknown_order_seconds,
             clock=clock,
         )
+        risk = RiskEngine(
+            gateway,
+            sessionmaker,
+            strategy,
+            market_id=market_id,
+            coin=meta.coin,
+            user=user,
+            network=gateway.network,
+            notifier=notifier,
+            clock=clock,
+        )
         return cls(
             gateway,
             sessionmaker,
@@ -158,6 +178,8 @@ class Reconciler:
             coin=meta.coin,
             user=user,
             clock=clock,
+            risk=risk,
+            notifier=notifier,
         )
 
     async def run(self, trigger: str) -> ReconciliationReport:
@@ -366,6 +388,33 @@ class Reconciler:
                     )
                 )
 
+        # 7. Лимиты убытка (в т. ч. нереализованный убыток) и лимит запросов адреса.
+        if self.risk is not None:
+            snap = await self.risk.snapshot()
+            for breach in self.risk.loss_breaches(snap):
+                diffs.append(
+                    Difference(
+                        DiffKind.LOSS_LIMIT,
+                        Severity.CRITICAL,
+                        breach,
+                        details={
+                            "daily_pnl": str(snap.daily_pnl),
+                            "weekly_pnl": str(snap.weekly_pnl),
+                            "equity": str(snap.equity),
+                        },
+                    )
+                )
+            limits = await self.gateway.get_user_rate_limit(self.user)
+            if limits.remaining < self.risk.strategy.risk.address_requests_warning:
+                diffs.append(
+                    Difference(
+                        DiffKind.ADDRESS_RATE_LIMIT,
+                        Severity.WARNING,
+                        f"у адреса осталось {limits.remaining} запросов",
+                        details={"remaining": limits.remaining},
+                    )
+                )
+
         await self.tracker.snapshot()
         return await self._finish(run_id, diffs, exchange_position, expected)
 
@@ -380,10 +429,11 @@ class Reconciler:
         warnings = [d for d in diffs if d.severity is Severity.WARNING]
         status = "critical" if critical else "warnings" if warnings else "ok"
         blocked = False
+        newly_blocked = False
         async with self.sm.begin() as db:
             if critical:
                 reason = "сверка: " + "; ".join(d.message for d in critical)
-                await control.block_entries(
+                newly_blocked = await control.block_entries(
                     db, self.network, actor=RECONCILER_ACTOR, reason=reason[:500]
                 )
                 state = await control.get_bot_state(db)
@@ -409,6 +459,10 @@ class Reconciler:
                     "warnings": len(warnings),
                 },
                 differences=[d.as_row() for d in diffs],
+            )
+        if newly_blocked:
+            await self.notifier.send(
+                "сверка: " + "; ".join(d.message for d in critical) + ". Новые входы заблокированы."
             )
         return ReconciliationReport(
             run_id=run_id,

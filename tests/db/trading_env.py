@@ -48,6 +48,15 @@ class Clock:
         return self.now
 
 
+class RecordingNotifier:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def send(self, text: str) -> bool:
+        self.messages.append(text)
+        return True
+
+
 @dataclass
 class Env:
     fake: FakeHyperliquid
@@ -55,6 +64,7 @@ class Env:
     sm: async_sessionmaker[AsyncSession]
     clock: Clock
     previews: list[OrderPreview]
+    notifier: RecordingNotifier
 
     async def yes(self, preview: OrderPreview) -> bool:
         self.previews.append(preview)
@@ -91,6 +101,8 @@ class Env:
             coin=self.engine.coin,
             user=ACCOUNT,
             clock=self.clock,
+            risk=self.engine.risk,
+            notifier=self.notifier,
         )
 
 
@@ -147,8 +159,11 @@ async def env(committing_sessionmaker: async_sessionmaker[AsyncSession]) -> Asyn
             exchange=ExchangeClient(BASE, transport=transport),
             clock=clock,
         ) as session:
-            engine = await ExecutionEngine.create(session, gateway, sm, strategy, clock=clock)
+            notifier = RecordingNotifier()
+            engine = await ExecutionEngine.create(
+                session, gateway, sm, strategy, notifier=notifier, clock=clock
+            )
             await seed_candles(sm, engine.market_id)
-            yield Env(fake, engine, sm, clock, [])
+            yield Env(fake, engine, sm, clock, [], notifier)
     finally:
         await db_engine.dispose()

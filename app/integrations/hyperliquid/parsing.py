@@ -538,3 +538,13 @@ def parse_ledger_events(data: Any) -> list[LedgerEvent]:
             )
         )
     return events
+
+
+def parse_spot_usdc(data: Any) -> Decimal:
+    """Общий баланс USDC на spot (spotClearinghouseState)."""
+    state = _obj(data, "spotClearinghouseState")
+    for i, item in enumerate(_list(_get(state, "balances", "spotClearinghouseState"), "balances")):
+        balance = _obj(item, f"balances[{i}]")
+        if _str(balance, "coin", f"balances[{i}]") == "USDC":
+            return _dec(balance, "total", f"balances[{i}]")
+    return Decimal(0)

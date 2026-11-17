@@ -11,6 +11,14 @@ from collections.abc import Awaitable, Callable
 
 IP_WEIGHT_PER_MINUTE = 1200
 
+# Все процессы бота работают с одного IP: бюджеты в сумме меньше лимита биржи (1100 < 1200),
+# запас — для ручных запросов и отмен. Отмены идут через отдельный бюджет /exchange.
+SERVICE_WEIGHT_BUDGETS: dict[str, int] = {
+    "collector": 200,
+    "reconciler": 300,
+    "trading": 600,
+}
+
 # Базовый вес info-запросов. Всё, чего нет в таблице, — 20.
 INFO_WEIGHTS: dict[str, int] = {
     "l2Book": 2,

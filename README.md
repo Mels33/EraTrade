@@ -77,6 +77,20 @@ ERATRADE_ENV_FILE=.env.mainnet uv run eratrade accept-position -r "закрыл 
 ERATRADE_ENV_FILE=.env.mainnet uv run eratrade unblock -r "разобрался"
 ```
 
+Риск и аварийные команды (этап 8):
+
+```bash
+ERATRADE_ENV_FILE=.env.mainnet uv run eratrade risk-status           # equity, PnL дня/недели, лимиты
+ERATRADE_ENV_FILE=.env.mainnet uv run eratrade pause -r "..."        # запрет входов (ключ не нужен)
+ERATRADE_ENV_FILE=$E uv run eratrade flatten                         # закрыть позицию
+ERATRADE_ENV_FILE=$E uv run eratrade cancel-all -r "..."             # отменить все ордера (и стопы!)
+ERATRADE_ENV_FILE=$E uv run eratrade kill -r "..."                   # pause → flatten → cancel → DISABLED
+```
+
+Размер позиции считается от риска до стопа: `min(10 USDC, 0.5% equity) / дистанция`, затем
+урезается лимитом номинала, маржой и `--notional`. Equity = spot USDC + perp account value.
+Уведомления — Telegram (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` в `.env.mainnet`), иначе в лог.
+
 Новые входы разрешены только в режиме `LIVE_ENABLED` (включается `set-mode` из `LIVE_PAUSED`
 с подтверждением); закрытие и стопы — также в `LIVE_PAUSED`.
 

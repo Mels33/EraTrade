@@ -56,6 +56,8 @@ from app.integrations.hyperliquid.exchange_client import ExchangeResponse
 from app.integrations.hyperliquid.gateway import INTERVALS, HyperliquidGateway
 from app.market_data.metadata import sync_market
 from app.observability.logging import current_correlation_id
+from app.observability.notify import LogNotifier, Notifier
+from app.risk.engine import RiskEngine
 
 ENGINE_ACTOR = Actor(ActorKind.SYSTEM, "execution")
 BPS = Decimal(10_000)
@@ -85,6 +87,8 @@ class OrderPreview:
     available_to_trade: Decimal
     stop_trigger: Decimal | None = None
     max_loss_at_stop: Decimal | None = None
+    risk_amount: Decimal | None = None
+    sizing_limited_by: tuple[str, ...] = ()
 
 
 @dataclass
@@ -124,6 +128,7 @@ class ExecutionEngine:
         rules: InstrumentRules,
         strategy: StrategyConfig,
         user: str,
+        notifier: Notifier | None = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.session = session
@@ -136,6 +141,18 @@ class ExecutionEngine:
         self.user = user
         self.clock = clock
         self.coin = rules.coin
+        self.notifier = notifier or LogNotifier()
+        self.risk = RiskEngine(
+            gateway,
+            sessionmaker,
+            strategy,
+            market_id=market_id,
+            coin=rules.coin,
+            user=user,
+            network=network,
+            notifier=self.notifier,
+            clock=clock,
+        )
         self.tracker = OrderTracker(
             gateway,
             sessionmaker,
@@ -154,6 +171,7 @@ class ExecutionEngine:
         sessionmaker: async_sessionmaker[AsyncSession],
         strategy: StrategyConfig,
         *,
+        notifier: Notifier | None = None,
         clock: Callable[[], datetime] = _utc_now,
     ) -> "ExecutionEngine":
         async with sessionmaker.begin() as db:
@@ -167,6 +185,7 @@ class ExecutionEngine:
             rules=rules,
             strategy=strategy,
             user=session.wallet.account,
+            notifier=notifier,
             clock=clock,
         )
 
@@ -258,48 +277,66 @@ class ExecutionEngine:
     async def open_position(
         self,
         side: Side,
-        notional: Decimal,
+        notional: Decimal | None = None,
         *,
         confirm: Confirm | None,
         stop_price: Decimal | None = None,
     ) -> TradeResult:
+        """Вход. Размер — от риска до стопа (§12.1); notional, если задан, ограничивает сверху."""
         if self.strategy.execution.require_manual_confirmation and confirm is None:
             raise ExecutionError("требуется ручное подтверждение каждого ордера")
         snap = await self._snapshot()
         mid = snap.book.mid
         price = self._ioc_price(side, mid)
-        size = self.rules.round_size_down(notional / mid)
         distance = (
             abs(mid - stop_price) if stop_price is not None else await self.stop_distance(mid)
         )
         stop_trigger = stop_price or self._stop_trigger(side, mid, distance)
+        target_leverage = self.strategy.market.leverage
+        available = (
+            snap.asset.available_to_trade_buy
+            if side is Side.BUY
+            else snap.asset.available_to_trade_sell
+        )
+        risk_snap = await self.risk.snapshot()
+        sizing = self.risk.size(
+            risk_snap,
+            side=side,
+            entry_price=price,
+            stop_price=stop_trigger,
+            available_margin=available,
+            leverage=target_leverage,
+            rules=self.rules,
+            requested_notional=notional,
+        )
+        # Для отклонённого расчёта в БД всё равно сохраняется намерение (минимальный шаг).
+        min_step = Decimal(1).scaleb(-self.rules.sz_decimals)
+        size = sizing.size if sizing.approved else min_step
         proposed = ProposedOrder(
             OrderPurpose.ENTRY, OrderKind.LIMIT_IOC, side, size, price, reduce_only=False
         )
-        target_leverage = self.strategy.market.leverage
         order = await self._create(
             proposed,
             intent={
-                "requested_notional": str(notional),
+                "requested_notional": str(notional) if notional is not None else None,
                 "mid": str(mid),
-                "raw_size": str(notional / mid),
-                "raw_limit_price": str(
-                    mid
-                    * (
-                        1
-                        + (1 if side is Side.BUY else -1)
-                        * self.strategy.limits.max_slippage_bps
-                        / BPS
-                    )
-                ),
+                "equity": str(risk_snap.equity),
+                "risk_amount": str(sizing.risk_amount),
+                "sizing_limited_by": list(sizing.limited_by),
                 "stop_trigger_planned": str(stop_trigger),
                 "stop_distance": str(distance),
+                "daily_pnl": str(risk_snap.daily_pnl),
+                "trades_today": risk_snap.trades_today,
             },
         )
         # Первичная проверка — с плечом, которое будет выставлено перед отправкой.
-        decision = self._guard(proposed, snap, leverage=target_leverage)
-        if not decision.approved:
-            return TradeResult(await self._block(order, decision.reasons))
+        reasons = [*self.risk.entry_blocks(risk_snap)]
+        if sizing.refused:
+            reasons.append(sizing.refused)
+        else:
+            reasons.extend(self._guard(proposed, snap, leverage=target_leverage).reasons)
+        if reasons:
+            return TradeResult(await self._block(order, tuple(reasons)))
 
         preview = OrderPreview(
             purpose=OrderPurpose.ENTRY,
@@ -311,19 +348,22 @@ class ExecutionEngine:
             spread_bps=snap.book.spread_bps,
             position_size=snap.position_size,
             leverage_target=target_leverage,
-            available_to_trade=snap.asset.available_to_trade_buy,
+            available_to_trade=available,
             stop_trigger=stop_trigger,
-            max_loss_at_stop=size * abs(mid - stop_trigger),
+            max_loss_at_stop=size * abs(price - stop_trigger),
+            risk_amount=sizing.risk_amount,
+            sizing_limited_by=sizing.limited_by,
         )
         if confirm is not None and not await confirm(preview):
             return TradeResult(await self._block(order, ("оператор отклонил ордер",)))
 
         await self.ensure_leverage()
-        # Повторная проверка на свежем состоянии с фактическим плечом.
+        # Повторная проверка непосредственно перед подписью: свежее состояние и лимиты.
         snap = await self._snapshot()
-        decision = self._guard(proposed, snap)
-        if not decision.approved:
-            return TradeResult(await self._block(order, decision.reasons))
+        risk_snap = await self.risk.snapshot()
+        reasons = [*self.risk.entry_blocks(risk_snap), *self._guard(proposed, snap).reasons]
+        if reasons:
+            return TradeResult(await self._block(order, tuple(reasons)))
 
         entry = await self._send(order.id, proposed)
         result = TradeResult(entry)
@@ -391,6 +431,7 @@ class ExecutionEngine:
         logfire.error("execution: {message}", message=message)
         async with self.sm.begin() as db:
             await control.block_entries(db, self.network, actor=ENGINE_ACTOR, reason=message)
+        await self.notifier.send(message)
         return [message + " — новые входы заблокированы, закройте позицию или поставьте stop"]
 
     # --- закрытие ---

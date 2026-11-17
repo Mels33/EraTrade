@@ -28,6 +28,7 @@ from app.domain.market import AssetContext, Candle, MarketMeta
 from app.integrations.hyperliquid import parsing
 from app.integrations.hyperliquid.errors import HyperliquidFormatError, UnknownMarketError
 from app.integrations.hyperliquid.info_client import InfoClient
+from app.integrations.hyperliquid.rate_limit import SERVICE_WEIGHT_BUDGETS, TokenBucket
 
 INTERVALS: dict[str, timedelta] = {
     "1m": timedelta(minutes=1),
@@ -237,6 +238,12 @@ class HyperliquidGateway:
             time_of=lambda e: e.time,
         )
 
+    async def get_spot_usdc(self, user: str) -> Decimal:
+        data = await self._client.post(
+            {"type": "spotClearinghouseState", "user": normalize_address(user)}
+        )
+        return parsing.parse_spot_usdc(data)
+
     async def get_active_asset_data(self, user: str, coin: str) -> ActiveAssetData:
         data = await self._client.post(
             {"type": "activeAssetData", "user": normalize_address(user), "coin": coin}
@@ -256,7 +263,11 @@ class HyperliquidGateway:
 
 
 @asynccontextmanager
-async def open_gateway(settings: Settings) -> AsyncIterator[HyperliquidGateway]:
-    """Шлюз для сети из настроек: URL выводится из HYPERLIQUID_NETWORK, вручную не задаётся."""
-    async with InfoClient(settings.hyperliquid_api_url) as client:
+async def open_gateway(
+    settings: Settings, *, service: str = "trading"
+) -> AsyncIterator[HyperliquidGateway]:
+    """Шлюз для сети из настроек: URL выводится из HYPERLIQUID_NETWORK, вручную не задаётся.
+    service определяет долю общего IP-лимита запросов (SERVICE_WEIGHT_BUDGETS)."""
+    bucket = TokenBucket.per_minute(SERVICE_WEIGHT_BUDGETS[service])
+    async with InfoClient(settings.hyperliquid_api_url, bucket=bucket) as client:
         yield HyperliquidGateway(client, settings.network)

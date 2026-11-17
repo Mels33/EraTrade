@@ -36,13 +36,18 @@ class FakeHyperliquid:
         self.entry_px: Decimal | None = None
         self.leverage_type = "isolated"
         self.leverage = 12
-        self.available = Decimal("98.45")
+        self.available = Decimal("98.45")  # availableToTrade (маржа)
+        self.spot_usdc = Decimal("98.45")  # equity для расчёта риска
         self.orders: dict[int, dict[str, Any]] = {}  # все ордера по oid (история)
         self.fills: list[dict[str, Any]] = []
         self.next_oid = 1000
         self.next_tid = 1
         self.exchange_actions: list[dict[str, Any]] = []
         self.funding: list[dict[str, Any]] = []
+        self.scheduled_cancel_ms: int | None = None
+        self.unrealized_pnl = Decimal(0)
+        self.requests_used = 1500
+        self.requests_cap = 200_000
         self.ledger: list[dict[str, Any]] = []
         # Сбои и особые ответы.
         self.fail_next: str | None = None
@@ -97,6 +102,18 @@ class FakeHyperliquid:
             }
         if t == "clearinghouseState":
             return self._clearinghouse()
+        if t == "spotClearinghouseState":
+            return {
+                "balances": [
+                    {
+                        "coin": "USDC",
+                        "token": 0,
+                        "total": str(self.spot_usdc),
+                        "hold": "0.0",
+                        "entryNtl": "0.0",
+                    }
+                ]
+            }
         if t == "frontendOpenOrders":
             return [self._order_view(o) for o in self.orders.values() if o["status"] == "open"]
         if t == "orderStatus":
@@ -113,6 +130,13 @@ class FakeHyperliquid:
             }
         if t == "userFillsByTime":
             return [f for f in self.fills if f["time"] >= p["startTime"]]
+        if t == "userRateLimit":
+            return {
+                "cumVlm": "190000.0",
+                "nRequestsUsed": self.requests_used,
+                "nRequestsCap": self.requests_cap,
+                "nRequestsSurplus": 0,
+            }
         if t == "userFunding":
             return [e for e in self.funding if e["time"] >= p["startTime"]]
         if t == "userNonFundingLedgerUpdates":
@@ -147,7 +171,7 @@ class FakeHyperliquid:
                         "leverage": {"type": self.leverage_type, "value": self.leverage},
                         "entryPx": str(self.entry_px),
                         "positionValue": str(abs(self.position) * self.mid),
-                        "unrealizedPnl": "0.0",
+                        "unrealizedPnl": str(self.unrealized_pnl),
                         "returnOnEquity": "0.0",
                         "liquidationPx": None,
                         "marginUsed": str(abs(self.position) * self.mid / self.leverage),
@@ -214,6 +238,12 @@ class FakeHyperliquid:
         if t == "updateLeverage":
             self.leverage_type = "cross" if action["isCross"] else "isolated"
             self.leverage = action["leverage"]
+            return {"status": "ok", "response": {"type": "default"}}
+        if t == "scheduleCancel":
+            when = action.get("time")
+            if when is not None and when < self.now_ms + 5000:
+                return {"status": "err", "response": "Scheduled cancel time too early"}
+            self.scheduled_cancel_ms = when
             return {"status": "ok", "response": {"type": "default"}}
         if t == "cancelByCloid":
             order = self._find(action["cancels"][0]["cloid"])
@@ -373,3 +403,12 @@ class FakeHyperliquid:
                 "delta": {"type": "deposit", "usdc": usdc},
             }
         )
+
+    def advance(self, ms: int) -> None:
+        """Время биржи идёт вперёд; срабатывает scheduleCancel, если пора."""
+        self.now_ms += ms
+        if self.scheduled_cancel_ms is not None and self.now_ms >= self.scheduled_cancel_ms:
+            for order in self.orders.values():
+                if order["status"] == "open":
+                    order["status"] = "scheduledCancel"
+            self.scheduled_cancel_ms = None

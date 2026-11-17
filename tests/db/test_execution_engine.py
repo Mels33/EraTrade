@@ -96,7 +96,6 @@ async def test_exchange_rejection_is_recorded(env: Env) -> None:
     [
         ("mode_disabled", "не разрешает новые входы"),
         ("entries_blocked", "новые входы запрещены"),
-        ("too_big", "больше лимита"),
         ("too_small", "меньше минимума"),
         ("wide_spread", "шире лимита"),
         ("no_margin", "доступно"),
@@ -109,8 +108,6 @@ async def test_guard_blocks_before_anything_is_sent(env: Env, setup: str, reason
     elif setup == "entries_blocked":
         async with env.sm.begin() as db:
             await control.block_entries(db, Network.TESTNET, actor=OPERATOR, reason="test block")
-    elif setup == "too_big":
-        notional = Decimal("50")
     elif setup == "too_small":
         notional = Decimal("5")
     elif setup == "wide_spread":
@@ -123,6 +120,43 @@ async def test_guard_blocks_before_anything_is_sent(env: Env, setup: str, reason
     assert any(reason in r for r in result.order.guard_reasons)
     assert env.fake.exchange_actions == []  # ни плечо, ни ордер не отправлялись
     assert env.previews == []  # оператору не предлагали подтвердить заведомо запрещённое
+
+
+async def test_requested_notional_above_limit_is_capped(env: Env) -> None:
+    # §12.1: размер ограничивается лимитом номинала, а не отклоняется.
+    result = await env.engine.open_position(Side.BUY, Decimal("50"), confirm=env.yes)
+    assert result.order is not None and result.order.status is OrderStatus.FILLED
+    assert result.order.filled_size == Decimal("0.0003")  # 20 USDC / 65065, вниз
+    [preview] = env.previews
+    assert any("лимит номинала" in label for label in preview.sizing_limited_by)
+
+
+async def test_size_from_risk_without_requested_notional(env: Env) -> None:
+    # equity 98.45 → риск min(10, 0.5%) = 0.49225 USDC; дистанция до стопа 65065 − 64675 = 390
+    # → 0.00126 BTC ≈ 82 USDC, урезается лимитом номинала до 0.0003.
+    env.fake.spot_usdc = Decimal("98.45")
+    result = await env.engine.open_position(Side.BUY, None, confirm=env.yes)
+    assert result.order is not None and result.order.filled_size == Decimal("0.0003")
+    [preview] = env.previews
+    assert preview.risk_amount == Decimal("0.49225")
+
+
+async def test_small_equity_limits_size_by_risk(env: Env) -> None:
+    env.fake.spot_usdc = Decimal("1000")  # риск 5 USDC
+    env.engine.strategy = env.engine.strategy.model_copy(
+        update={
+            "limits": env.engine.strategy.limits.model_copy(
+                update={"max_position_notional_usdc": Decimal("10000")}
+            )
+        }
+    )
+    env.engine.risk.strategy = env.engine.strategy
+    env.fake.available = Decimal("100000")
+    result = await env.engine.open_position(Side.BUY, None, confirm=env.yes)
+    assert result.order is not None
+    # 5 / 390 = 0.012820… → 0.01282 BTC: ограничение именно риском
+    assert result.order.filled_size == Decimal("0.01282")
+    assert any("риск" in label for label in env.previews[0].sizing_limited_by)
 
 
 async def test_operator_decline_sends_nothing(env: Env) -> None:

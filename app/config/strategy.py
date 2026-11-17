@@ -60,6 +60,23 @@ class ExecutionConfig(_Frozen):
     require_manual_confirmation: bool
 
 
+class RiskConfig(_Frozen):
+    loss_includes_unrealized: bool
+    address_requests_warning: int = Field(ge=0)
+
+
+class DeadMansSwitchConfig(_Frozen):
+    enabled: bool
+    horizon_seconds: int = Field(ge=10)
+    refresh_seconds: int = Field(ge=5)
+
+    @model_validator(mode="after")
+    def _refresh_before_horizon(self) -> "DeadMansSwitchConfig":
+        if self.refresh_seconds >= self.horizon_seconds - 5:
+            raise ValueError("refresh_seconds должен быть меньше horizon_seconds - 5")
+        return self
+
+
 class StrategyConfig(_Frozen):
     spec_version: int
     market: MarketConfig
@@ -68,6 +85,8 @@ class StrategyConfig(_Frozen):
     limits: LimitsConfig
     freshness: FreshnessConfig
     execution: ExecutionConfig
+    risk: RiskConfig
+    dead_mans_switch: DeadMansSwitchConfig
 
     @model_validator(mode="after")
     def _check_cross_fields(self) -> "StrategyConfig":
