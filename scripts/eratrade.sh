@@ -7,6 +7,8 @@
 #   scripts/eratrade.sh status    — контейнеры и сводка состояния бота
 #   scripts/eratrade.sh logs [сервис]  — логи (по умолчанию всех сервисов)
 #   scripts/eratrade.sh dev       — разработка: БД в Docker, API и панель локально с перезагрузкой
+#   scripts/eratrade.sh auto-start — этап 15: автоматический trader в Docker (после барьера [auto])
+#   scripts/eratrade.sh auto-stop  — остановить автоматический trader (позиция и стоп остаются)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -125,6 +127,8 @@ cmd_up() {
 cmd_down() {
   bold "Остановка EraTrade"
   echo "Внимание: коллектор перестанет собирать данные, сверка — проверять аккаунт."
+  # Автоматический trader (профиль live) останавливаем первым и сам он не вернётся.
+  "${COMPOSE[@]}" --profile live stop trader-mainnet >/dev/null 2>&1 || true
   compose down
   green "Остановлено. Данные БД сохранены (volume eratrade_pg_data)."
 }
@@ -168,6 +172,27 @@ cmd_dev() {
   wait
 }
 
+cmd_auto_start() {
+  check_env
+  red "АВТОМАТИЧЕСКОЕ ИСПОЛНЕНИЕ на MAINNET: ордера без подтверждения (docs/runbook.md §8)"
+  read -r -p "Введите AUTO для запуска: " answer
+  [[ "$answer" == "AUTO" ]] || { echo "Отменено"; exit 1; }
+  "${COMPOSE[@]}" --profile live up -d --build trader-mainnet
+  sleep 15
+  if [[ "$(docker inspect -f '{{.State.Running}}' eratrade-trader-mainnet 2>/dev/null)" != "true" ]]; then
+    red "trader не запущен — барьер не пройден или ошибка:"
+    docker logs --tail 30 eratrade-trader-mainnet
+    exit 1
+  fi
+  green "trader запущен. Торговля начнётся только в режиме LIVE_ENABLED (eratrade set-mode)."
+  docker logs --tail 10 eratrade-trader-mainnet
+}
+
+cmd_auto_stop() {
+  "${COMPOSE[@]}" --profile live stop trader-mainnet
+  green "trader остановлен. Открытая позиция защищена стопом на бирже; закрыть: eratrade flatten"
+}
+
 case "${1:-}" in
   up) cmd_up ;;
   down) cmd_down ;;
@@ -175,8 +200,10 @@ case "${1:-}" in
   status) cmd_status ;;
   logs) shift; cmd_logs "$@" ;;
   dev) cmd_dev ;;
+  auto-start) cmd_auto_start ;;
+  auto-stop) cmd_auto_stop ;;
   *)
-    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

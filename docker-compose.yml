@@ -83,6 +83,32 @@ services:
       driver: json-file
       options: {max-size: "20m", max-file: "5"}
 
+  # Автоматическое исполнение (этап 15, docs/runbook.md §8). Отдельный профиль `live` —
+  # не запускается вместе с остальными сервисами. restart: "no" — после падения торговля сама
+  # не возобновляется; при старте LIVE_ENABLED понижается до LIVE_PAUSED, включает оператор.
+  # Процесс сам откажется работать, если не пройден барьер [auto] в config/strategy.toml.
+  trader-mainnet:
+    build: .
+    container_name: eratrade-trader-mainnet
+    profiles: ["live"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: [.env.mainnet, .env.mainnet.secrets]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
+      ERATRADE_ENV_FILE: /nonexistent
+      MODELS_DIR: /app/models
+    volumes:
+      - ./models:/app/models:ro
+      - ./backups:/backups:ro
+    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade trader --auto --backups /backups"]
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
   # API и панель управления (§13). Порт опубликован только на 127.0.0.1.
   # Ключ API-кошелька нужен только для cancel-all/flatten/kill; открыть позицию через API нельзя.
   api-mainnet:

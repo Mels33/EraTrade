@@ -28,10 +28,13 @@ from app.db.repositories import control
 from app.db.repositories import market as market_repo
 from app.db.repositories import models as models_repo
 from app.domain.account import Side
+from app.domain.control import Actor, ActorKind
 from app.domain.orders import OrderStatus
+from app.execution import emergency
 from app.execution.engine import Confirm, ExecutionEngine, TradeResult
+from app.live.review import round_trips
 from app.market_data.collector import floor_time
-from app.reconciliation.reconciler import Reconciler, ReconciliationReport
+from app.reconciliation.reconciler import Reconciler, ReconciliationReport, Severity
 from app.signals.policy import Decision, PolicyParams
 from app.signals.service import (
     PredictorCache,
@@ -42,6 +45,7 @@ from app.signals.service import (
 )
 
 COMPONENT = "trader"
+AUTO_ACTOR = Actor(ActorKind.SYSTEM, "auto-trader")
 OPERATOR_DECLINED = "оператор отклонил ордер"
 
 
@@ -62,6 +66,7 @@ class CycleReport:
     reconciliation_critical: bool = False
     outcomes_filled: int = 0
     warnings: list[str] = field(default_factory=list)
+    paused: str | None = None  # причина автопаузы (режим auto)
 
 
 def engine_reconciler(engine: ExecutionEngine) -> Reconciler:
@@ -116,8 +121,10 @@ class TradingCycle:
         reconcile: Callable[[], Awaitable[ReconciliationReport]] | None = None,
         config: CycleConfig = CycleConfig(),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        auto: bool = False,
     ) -> None:
         self.engine = engine
+        self.auto = auto
         self.predictors = predictors
         self.params = params
         self.interval = interval
@@ -137,6 +144,42 @@ class TradingCycle:
         self.instance_id = uuid.uuid4().hex[:12]
         self.started_at = self.clock()
         self.last_report: CycleReport | None = None
+        self._reviewed_until = self.started_at  # сделки, закрытые раньше, уже разобраны
+
+    # --- автопауза (этап 15) ---
+
+    async def _auto_pause(self, report: CycleReport, reason: str) -> None:
+        """В режиме auto любая необъяснимая ситуация останавливает новые входы до оператора."""
+        if not self.auto or report.paused:
+            return
+        report.paused = reason
+        async with self.engine.sm() as session:
+            state = await control.get_bot_state(session)
+        if state is not None and state.entries_blocked:
+            return  # уже на паузе — не дублируем уведомление каждый час
+        await emergency.pause(
+            self.engine.sm,
+            self.engine.network,
+            actor=AUTO_ACTOR,
+            reason=f"автопауза: {reason}",
+            notifier=self.engine.notifier,
+        )
+
+    async def _review_closed_trades(self, report: CycleReport) -> None:
+        async with self.engine.sm() as session:
+            trips = await round_trips(session, self.engine.market_id, self.engine.strategy)
+        fresh = [
+            t
+            for t in trips
+            if t.bot_entry and t.closed_at is not None and t.closed_at > self._reviewed_until
+        ]
+        for trip in fresh:
+            if trip.checks:
+                await self._auto_pause(
+                    report, f"разбор сделки {trip.opened_at:%m-%d %H:%M}: {'; '.join(trip.checks)}"
+                )
+        if fresh:
+            self._reviewed_until = max(t.closed_at for t in fresh if t.closed_at)
 
     # --- шаги ---
 
@@ -239,6 +282,8 @@ class TradingCycle:
         details: dict[str, Any] = {
             "last_decision_time": last.decision_time.isoformat() if last else None,
             "last_execution": last.execution_status if last else None,
+            "auto": self.auto,
+            "paused": last.paused if last else None,
         }
         async with self.engine.sm.begin() as session:
             await control.beat(
@@ -261,10 +306,27 @@ class TradingCycle:
             try:
                 reconciliation = await self._reconcile()
                 report.reconciliation_critical = bool(reconciliation.critical)
+                unexplained = [
+                    d
+                    for d in reconciliation.differences
+                    if not d.repaired
+                    and (
+                        d.severity is Severity.CRITICAL
+                        or (
+                            d.severity is Severity.WARNING
+                            and self.engine.strategy.auto.pause_on_warnings
+                        )
+                    )
+                ]
+                if unexplained:
+                    await self._auto_pause(
+                        report, "сверка: " + "; ".join(d.message for d in unexplained)
+                    )
             except Exception as exc:
                 logfire.exception("trader: сверка не выполнена")
                 report.reconciliation_critical = True  # без сверки входить нельзя
                 report.warnings.append(f"сверка не выполнена: {exc}")
+                await self._auto_pause(report, f"сверка не выполнена: {exc}")
 
             side = await self._position_side()
             async with self.engine.sm.begin() as session:
@@ -288,6 +350,9 @@ class TradingCycle:
                 report.execution_detail = "нет активной модели — только shadow-сигналы"
             elif active.signal_id is not None:
                 await self._execute(report, active.signal_id, active.decision)
+                if report.execution_status == "error":
+                    await self._auto_pause(report, f"ошибка исполнения: {report.execution_detail}")
+            await self._review_closed_trades(report)
 
             async with self.engine.sm.begin() as session:
                 report.outcomes_filled = await fill_outcomes(
@@ -302,7 +367,20 @@ class TradingCycle:
         await self.heartbeat()
         return report
 
+    async def start(self) -> bool:
+        """Старт процесса цикла: LIVE_ENABLED прошлого запуска понижается до LIVE_PAUSED."""
+        async with self.engine.sm.begin() as session:
+            downgraded = await control.downgrade_after_restart(session, self.engine.network)
+        if downgraded:
+            await self.engine.notifier.send(
+                "EraTrade: торговый цикл перезапущен — режим понижен до LIVE_PAUSED. "
+                "Включение торговли — вручную (eratrade set-mode LIVE_ENABLED)."
+            )
+        return downgraded
+
     async def run_forever(self, on_report: Callable[[CycleReport], None] | None = None) -> None:
+        await self.start()
+
         async def beats() -> None:
             while True:
                 try:

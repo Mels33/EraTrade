@@ -141,6 +141,18 @@ async def unblock_entries(
     return True
 
 
+async def downgrade_after_restart(session: AsyncSession, network: Network) -> bool:
+    """Старт торгового цикла: LIVE_ENABLED из прошлого запуска → LIVE_PAUSED (spec §6).
+    Торговля после рестарта не возобновляется сама — LIVE_ENABLED включает оператор."""
+    state = await ensure_bot_state(session, network)
+    if state.trading_mode != TradingMode.LIVE_ENABLED.value:
+        return False
+    await set_trading_mode(
+        session, network, TradingMode.LIVE_PAUSED, actor=SYSTEM_STARTUP, reason="restart trader"
+    )
+    return True
+
+
 async def apply_startup_mode(
     session: AsyncSession, network: Network, configured: TradingMode
 ) -> BotStateRecord:

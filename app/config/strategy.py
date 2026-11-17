@@ -121,6 +121,14 @@ class LiveConfig(_Frozen):
     min_wallet_valid_days: int = Field(ge=0)
 
 
+class AutoConfig(_Frozen):
+    """Автоматическое исполнение (этап 15)."""
+
+    enabled: bool
+    min_manual_trades: int = Field(ge=1)
+    pause_on_warnings: bool
+
+
 class StrategyConfig(_Frozen):
     spec_version: int
     market: MarketConfig
@@ -134,6 +142,7 @@ class StrategyConfig(_Frozen):
     target: TargetConfig
     signal: SignalConfig
     live: LiveConfig
+    auto: AutoConfig
 
     @model_validator(mode="after")
     def _check_cross_fields(self) -> "StrategyConfig":

@@ -87,3 +87,11 @@ require_beats_baseline = true     # log loss по результатам shadow 
 max_backup_age_hours = 26
 max_restore_check_age_days = 7
 min_wallet_valid_days = 14
+
+[auto]
+# Автоматическое исполнение без подтверждения (этап 15, §17.3, docs/runbook.md §8).
+# Включается только явно: enabled = true И execution.require_manual_confirmation = false,
+# и только после ручного этапа. Иначе `eratrade trader --auto` не запустится.
+enabled = false
+min_manual_trades = 10       # закрытых сделок бота без замечаний разбора (eratrade trades)
+pause_on_warnings = true     # пауза при любом неисправленном расхождении сверки, не только critical

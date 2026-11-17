@@ -1453,20 +1453,52 @@ def _print_cycle(report: "CycleReport") -> None:
     )
     if report.outcomes_filled:
         typer.echo(f"  результатов сигналов заполнено: {report.outcomes_filled}")
+    if report.paused:
+        typer.secho(f"  АВТОПАУЗА: {report.paused}", fg=typer.colors.RED, bold=True)
 
 
 def _with_cycle(
-    settings: Settings, fn: Callable[["TradingCycle"], Awaitable[None]], confirm_timeout: float
+    settings: Settings,
+    fn: Callable[[TradingCycle], Awaitable[None]],
+    confirm_timeout: float,
+    *,
+    auto: bool = False,
+    backups: str = "backups",
 ) -> None:
+    from pathlib import Path
+
+    from app.live.auto import auto_failures
+    from app.live.readiness import readiness
     from app.signals.policy import PolicyParams
     from app.signals.service import PredictorCache
-    from app.workers.trader import TradingCycle
 
     strategy = load_strategy(settings.strategy_config_path)
     interval = strategy.market.interval
     step = INTERVALS[interval]
 
     async def _run(engine: ExecutionEngine) -> None:
+        if auto:
+            checks = await readiness(
+                settings,
+                strategy,
+                engine.sm,
+                engine.gateway,
+                market_id=engine.market_id,
+                backups_dir=Path(backups),
+                now=datetime.now(UTC),
+            )
+            async with engine.sm() as session:
+                failures = await auto_failures(session, engine.market_id, strategy, checks)
+            if failures:
+                typer.secho("Автоматическое исполнение запрещено:", fg=typer.colors.RED, bold=True)
+                for f in failures:
+                    typer.echo(f"  - {f}")
+                raise typer.Exit(code=1)
+            typer.secho(
+                "АВТОМАТИЧЕСКОЕ ИСПОЛНЕНИЕ: ордера отправляются без подтверждения",
+                fg=typer.colors.RED,
+                bold=True,
+            )
         cycle = TradingCycle(
             engine,
             PredictorCache(settings.models_dir),
@@ -1474,7 +1506,8 @@ def _with_cycle(
             interval=interval,
             step=step,
             max_delay=timedelta(seconds=strategy.freshness.max_decision_delay_seconds),
-            confirm=_make_confirm(settings, timeout=confirm_timeout),
+            confirm=None if auto else _make_confirm(settings, timeout=confirm_timeout),
+            auto=auto,
         )
         await fn(cycle)
 
@@ -1499,22 +1532,31 @@ def cycle_cmd(
 @app.command("trader")
 def trader_cmd(
     confirm_timeout: float = typer.Option(60, help="Сколько секунд ждать подтверждения ордера"),
+    auto: bool = typer.Option(
+        False,
+        "--auto",
+        help="Этап 15: исполнять без подтверждения (только если пройден барьер [auto])",
+    ),
+    backups: str = typer.Option("backups", help="Каталог бэкапов (для проверки готовности)"),
 ) -> None:
     """Торговый цикл: проход после закрытия каждой свечи. Держит блокировку единственного
-    trader-процесса; каждый ордер подтверждается в этом терминале. Ctrl+C — остановить."""
+    trader-процесса. Без --auto каждый ордер подтверждается в этом терминале.
+    При старте LIVE_ENABLED прошлого запуска понижается до LIVE_PAUSED. Ctrl+C — остановить."""
     settings = _load_settings()
     configure_logging(settings, service="trader")
-    typer.secho(
-        f"Торговый цикл {settings.network.value.upper()} запущен. Проход — через 5 с после "
-        "закрытия каждой часовой свечи. Ctrl+C — остановить.",
-        bold=True,
-    )
 
     async def _loop(cycle: "TradingCycle") -> None:
+        # баннер — только после барьера [auto] (в _with_cycle)
+        typer.secho(
+            f"Торговый цикл {settings.network.value.upper()} запущен"
+            + (" (АВТО)" if auto else "")
+            + ". Проход — через 5 с после закрытия каждой часовой свечи. Ctrl+C — остановить.",
+            bold=True,
+        )
         await cycle.run_forever(on_report=_print_cycle)
 
     try:
-        _with_cycle(settings, _loop, confirm_timeout)
+        _with_cycle(settings, _loop, confirm_timeout, auto=auto, backups=backups)
     except KeyboardInterrupt:
         typer.echo("Остановлено оператором")
 
