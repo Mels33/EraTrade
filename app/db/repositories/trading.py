@@ -2,7 +2,7 @@
 
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -100,6 +100,20 @@ async def list_orders(
         stmt = stmt.where(OrderRecord.status.in_([s.value for s in statuses]))
     if market_id is not None:
         stmt = stmt.where(OrderRecord.market_id == market_id)
+    return list((await session.execute(stmt)).scalars())
+
+
+async def list_stale_intents(
+    session: AsyncSession, market_id: int, older_than: timedelta
+) -> list[OrderRecord]:
+    """CREATED/APPROVED без nonce старше older_than. Сравнение по часам БД — теми же, что
+    поставили created_at, чтобы расхождение часов приложения и БД не влияло на решение."""
+    stmt = select(OrderRecord).where(
+        OrderRecord.market_id == market_id,
+        OrderRecord.status.in_([OrderStatus.CREATED.value, OrderStatus.APPROVED.value]),
+        OrderRecord.nonce.is_(None),
+        OrderRecord.created_at < func.now() - older_than,
+    )
     return list((await session.execute(stmt)).scalars())
 
 

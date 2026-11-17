@@ -14,7 +14,7 @@
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -39,11 +39,11 @@ from app.domain.orders import (
     PlacementFormatError,
     PlacementKind,
     is_final,
-    map_exchange_order_status,
     parse_placement_status,
 )
 from app.execution.guard import GuardContext, GuardDecision, ProposedOrder, check_order
 from app.execution.session import TradingSession
+from app.execution.tracker import OrderResult, OrderTracker
 from app.integrations.hyperliquid import actions
 from app.integrations.hyperliquid.errors import (
     ExchangeNotSentError,
@@ -85,29 +85,6 @@ class OrderPreview:
     available_to_trade: Decimal
     stop_trigger: Decimal | None = None
     max_loss_at_stop: Decimal | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class OrderResult:
-    order_id: uuid.UUID
-    cloid: str
-    status: OrderStatus
-    filled_size: Decimal
-    avg_price: Decimal | None
-    error: str | None = None
-    guard_reasons: tuple[str, ...] = ()
-
-    @classmethod
-    def of(cls, order: OrderRecord, guard_reasons: tuple[str, ...] = ()) -> "OrderResult":
-        return cls(
-            order_id=order.id,
-            cloid=order.cloid,
-            status=OrderStatus(order.status),
-            filled_size=order.filled_size,
-            avg_price=order.avg_fill_price,
-            error=order.error,
-            guard_reasons=guard_reasons,
-        )
 
 
 @dataclass
@@ -159,6 +136,15 @@ class ExecutionEngine:
         self.user = user
         self.clock = clock
         self.coin = rules.coin
+        self.tracker = OrderTracker(
+            gateway,
+            sessionmaker,
+            market_id=market_id,
+            coin=rules.coin,
+            user=user,
+            max_unknown_seconds=strategy.freshness.max_unknown_order_seconds,
+            clock=clock,
+        )
 
     @classmethod
     async def create(
@@ -633,6 +619,15 @@ class ExecutionEngine:
         await self._finish(order_id, OrderStatus.UNKNOWN, response=response.raw)
         return await self.resolve(order_id)
 
+    async def _integration_error(self, reason: str) -> None:
+        """Непонятный ответ биржи: новые действия останавливаются до ручного разбора."""
+        async with self.sm.begin() as db:
+            await control.block_entries(
+                db, self.network, actor=ENGINE_ACTOR, reason=f"ошибка интеграции: {reason}"[:500]
+            )
+
+    # --- сверка (делегируется OrderTracker) ---
+
     async def _finish(
         self,
         order_id: uuid.UUID,
@@ -641,135 +636,19 @@ class ExecutionEngine:
         source: str = "exchange_response",
         **updates: Any,
     ) -> OrderResult:
-        async with self.sm.begin() as db:
-            order = await repo.lock_order(db, order_id)
-            await repo.transition(
-                db,
-                order,
-                status,
-                source=source,
-                details={k: str(v) for k, v in updates.items() if k != "response"},
-                **updates,
-            )
-            result = OrderResult.of(order)
-        logfire.info(
-            "execution: ордер {cloid} → {status}",
-            cloid=result.cloid,
-            status=result.status.value,
-            filled=str(result.filled_size),
-            error=result.error,
-        )
-        return result
-
-    async def _integration_error(self, reason: str) -> None:
-        """Непонятный ответ биржи: новые действия останавливаются до ручного разбора."""
-        async with self.sm.begin() as db:
-            await control.block_entries(
-                db, self.network, actor=ENGINE_ACTOR, reason=f"ошибка интеграции: {reason}"[:500]
-            )
-
-    # --- сверка ---
+        return await self.tracker.finish(order_id, status, source=source, **updates)
 
     async def resolve(self, order_id: uuid.UUID) -> OrderResult:
-        """Уточняет состояние ордера на бирже по cloid (§10.4): orderStatus → fills → таймаут."""
-        async with self.sm() as db:
-            order = await repo.get_order(db, order_id)
-        if order is None:
-            raise ExecutionError(f"ордер {order_id} не найден")
-        current = OrderStatus(order.status)
-        kind = OrderKind(order.order_kind)
-        if is_final(current, kind) or current in (OrderStatus.CREATED, OrderStatus.APPROVED):
-            return OrderResult.of(order)
-
-        status = await self.gateway.get_order_status(self.user, order.cloid)
-        if status.found and status.order is not None and status.status is not None:
-            remote = status.order
-            target = map_exchange_order_status(status.status, remote.original_size, remote.size)
-            filled = remote.original_size - remote.size
-            if target is OrderStatus.CANCELED and filled > 0 and kind is OrderKind.LIMIT_IOC:
-                target = OrderStatus.PARTIALLY_FILLED
-            if target is OrderStatus.UNKNOWN or (target == current and filled == order.filled_size):
-                return OrderResult.of(order)
-            avg = await self._avg_from_fills(order, since=order.created_at)
-            return await self._finish(
-                order_id,
-                target,
-                source="order_status",
-                oid=remote.oid,
-                filled_size=min(filled, order.size),
-                avg_fill_price=avg or order.avg_fill_price,
-            )
-
-        fills = [
-            f
-            for f in await self.gateway.get_fills(
-                self.user, start=order.created_at - timedelta(minutes=1)
-            )
-            if f.cloid == order.cloid or (order.oid is not None and f.oid == order.oid)
-        ]
-        if fills:
-            async with self.sm.begin() as db:
-                await repo.add_fills(db, self.market_id, fills)
-            filled = min(sum((f.size for f in fills), Decimal(0)), order.size)
-            avg = sum((f.size * f.price for f in fills), Decimal(0)) / sum(f.size for f in fills)
-            target = OrderStatus.FILLED if filled >= order.size else OrderStatus.PARTIALLY_FILLED
-            return await self._finish(
-                order_id,
-                target,
-                source="fills",
-                oid=fills[0].oid,
-                filled_size=filled,
-                avg_fill_price=avg,
-            )
-
-        signed_at = order.signed_at or order.created_at
-        timeout = timedelta(seconds=self.strategy.freshness.max_unknown_order_seconds)
-        if (
-            current in (OrderStatus.SIGNED, OrderStatus.UNKNOWN)
-            and self.clock() - signed_at > timeout
-        ):
-            return await self._finish(
-                order_id,
-                OrderStatus.REJECTED,
-                source="order_status",
-                error="не найден на бирже по cloid и нет исполнений: ордер не был принят",
-            )
-        return OrderResult.of(order)
-
-    async def _avg_from_fills(self, order: OrderRecord, *, since: datetime) -> Decimal | None:
-        fills = [
-            f
-            for f in await self.gateway.get_fills(self.user, start=since - timedelta(minutes=1))
-            if f.cloid == order.cloid or (order.oid is not None and f.oid == order.oid)
-        ]
-        if not fills:
-            return None
-        async with self.sm.begin() as db:
-            await repo.add_fills(db, self.market_id, fills)
-        total = sum((f.size for f in fills), Decimal(0))
-        return sum((f.size * f.price for f in fills), Decimal(0)) / total
+        return await self.tracker.resolve(order_id)
 
     async def resolve_unresolved(self) -> list[OrderResult]:
-        async with self.sm() as db:
-            orders = await repo.list_orders(
-                db, statuses=list(repo.UNRESOLVED), market_id=self.market_id, limit=200
-            )
-        return [await self.resolve(o.id) for o in orders]
+        return await self.tracker.resolve_unresolved()
 
     async def sync_fills(self, since: datetime) -> int:
-        fills = await self.gateway.get_fills(self.user, start=since)
-        fills = [f for f in fills if f.coin == self.coin]
-        async with self.sm.begin() as db:
-            return await repo.add_fills(db, self.market_id, fills)
+        return await self.tracker.sync_fills(since)
 
     async def snapshot(self) -> None:
-        state = await self.gateway.get_account_state(self.user)
-        asset = await self.gateway.get_active_asset_data(self.user, self.coin)
-        async with self.sm.begin() as db:
-            await repo.add_account_snapshot(db, state, asset)
-            await repo.add_position_snapshot(
-                db, self.market_id, state.position(self.coin), state.exchange_time
-            )
+        await self.tracker.snapshot()
 
     # --- плечо ---
 

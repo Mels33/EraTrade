@@ -13,9 +13,14 @@ uv run eratrade db-check
 uv run alembic upgrade head
 ```
 
-## Коллектор данных (mainnet, постоянно)
+## Фоновые сервисы (mainnet, постоянно)
 
-Собирает публичные данные BTC 1h и funding/OI с mainnet в `eratrade_mainnet`
+Профиль `collector` поднимает три сервиса без доступа к ключу API-кошелька:
+- `collector-mainnet` — свечи BTC 1h и funding/OI в `eratrade_mainnet`;
+- `reconciler-mainnet` — сверка с биржей раз в минуту (критичное расхождение → запрет входов, `LIVE_PAUSED`);
+- `pg-backup` — ежедневный бэкап обеих БД.
+
+Коллектор собирает публичные данные BTC 1h и funding/OI с mainnet в `eratrade_mainnet`
 (режим `DISABLED`, ключи не нужны). Плюс ежедневный бэкап обеих БД в `backups/` (14 дней).
 
 ```bash
@@ -61,6 +66,15 @@ ERATRADE_ENV_FILE=$E uv run eratrade close                     # reduceOnly-за
 ERATRADE_ENV_FILE=$E uv run eratrade cancel <cloid>
 ERATRADE_ENV_FILE=$E uv run eratrade resolve                   # сверка незавершённых ордеров по cloid
 ERATRADE_ENV_FILE=.env.mainnet uv run eratrade orders
+```
+
+Перед `open` и `close` всегда выполняется сверка с биржей (вход отменяется при критичных
+расхождениях). Разбор расхождений:
+
+```bash
+ERATRADE_ENV_FILE=.env.mainnet uv run eratrade reconcile                     # разовая сверка
+ERATRADE_ENV_FILE=.env.mainnet uv run eratrade accept-position -r "закрыл вручную"
+ERATRADE_ENV_FILE=.env.mainnet uv run eratrade unblock -r "разобрался"
 ```
 
 Новые входы разрешены только в режиме `LIVE_ENABLED` (включается `set-mode` из `LIVE_PAUSED`

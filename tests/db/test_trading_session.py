@@ -21,7 +21,7 @@ from app.integrations.hyperliquid.exchange_client import ExchangeClient
 from app.integrations.hyperliquid.gateway import HyperliquidGateway
 from app.integrations.hyperliquid.info_client import InfoClient
 from app.integrations.hyperliquid.parsing import datetime_to_ms
-from tests.db.conftest import TEST_DB_URL
+from tests.db.constants import TEST_DB_URL
 
 FIXTURES = Path(__file__).parents[1] / "hyperliquid" / "fixtures"
 TEST_KEY = "0x" + "22" * 32

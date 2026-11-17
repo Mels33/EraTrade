@@ -17,6 +17,8 @@ from app.domain.account import (
     AgentInfo,
     BestBidAsk,
     Fill,
+    FundingEvent,
+    LedgerEvent,
     OpenOrder,
     OrderStatusResult,
     Position,
@@ -497,3 +499,42 @@ def parse_best_bid_ask(data: Any) -> BestBidAsk:
     if bid >= ask:
         raise HyperliquidFormatError(f"l2Book: bid {bid} >= ask {ask}")
     return BestBidAsk(bid=bid, ask=ask, time=_time(book, "time", "l2Book"))
+
+
+def parse_funding_events(data: Any) -> list[FundingEvent]:
+    events = []
+    for i, item in enumerate(_list(data, "userFunding")):
+        what = f"userFunding[{i}]"
+        e = _obj(item, what)
+        delta = _obj(_get(e, "delta", what), f"{what}.delta")
+        events.append(
+            FundingEvent(
+                hash=_str(e, "hash", what),
+                coin=_str(delta, "coin", f"{what}.delta"),
+                time=_time(e, "time", what),
+                usdc=_dec(delta, "usdc", f"{what}.delta"),
+                position_size=_dec(delta, "szi", f"{what}.delta"),
+                funding_rate=_dec(delta, "fundingRate", f"{what}.delta"),
+                raw=dict(e),
+            )
+        )
+    return events
+
+
+def parse_ledger_events(data: Any) -> list[LedgerEvent]:
+    events = []
+    for i, item in enumerate(_list(data, "userNonFundingLedgerUpdates")):
+        what = f"ledger[{i}]"
+        e = _obj(item, what)
+        delta = _obj(_get(e, "delta", what), f"{what}.delta")
+        usdc = delta.get("usdc", delta.get("amount"))
+        events.append(
+            LedgerEvent(
+                hash=_str(e, "hash", what),
+                delta_type=_str(delta, "type", f"{what}.delta"),
+                time=_time(e, "time", what),
+                usdc=_to_decimal(usdc, f"{what}.delta.usdc") if usdc is not None else None,
+                raw=dict(e),
+            )
+        )
+    return events

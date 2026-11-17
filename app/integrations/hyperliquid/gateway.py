@@ -17,6 +17,8 @@ from app.domain.account import (
     AgentInfo,
     BestBidAsk,
     Fill,
+    FundingEvent,
+    LedgerEvent,
     OpenOrder,
     OrderStatusResult,
     RateLimitStatus,
@@ -36,6 +38,7 @@ INTERVALS: dict[str, timedelta] = {
     "1d": timedelta(days=1),
 }
 FILLS_PAGE_LIMIT = 2000  # userFillsByTime отдаёт не больше 2000 исполнений за запрос
+EVENTS_PAGE_LIMIT = 500  # userFunding / userNonFundingLedgerUpdates
 DEFAULT_CLOSE_GRACE = timedelta(seconds=10)
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -181,6 +184,58 @@ class HyperliquidGateway:
     async def get_user_rate_limit(self, user: str) -> RateLimitStatus:
         data = await self._client.post({"type": "userRateLimit", "user": normalize_address(user)})
         return parsing.parse_user_rate_limit(data)
+
+    async def _events_by_time[E](
+        self,
+        request_type: str,
+        user: str,
+        start: datetime,
+        parse: Callable[[object], list[E]],
+        key: Callable[[E], tuple[str, str]],
+        time_of: Callable[[E], datetime],
+    ) -> list[E]:
+        address = normalize_address(user)
+        result: dict[tuple[str, str], E] = {}
+        cursor = start
+        while True:
+            page = parse(
+                await self._client.post(
+                    {
+                        "type": request_type,
+                        "user": address,
+                        "startTime": parsing.datetime_to_ms(cursor),
+                    }
+                )
+            )
+            for event in page:
+                result[key(event)] = event
+            if len(page) < EVENTS_PAGE_LIMIT:
+                break
+            last = max(time_of(e) for e in page)
+            if last <= cursor:
+                raise HyperliquidFormatError(f"{request_type}: пагинация не продвигается")
+            cursor = last
+        return sorted(result.values(), key=time_of)
+
+    async def get_funding(self, user: str, start: datetime) -> list[FundingEvent]:
+        return await self._events_by_time(
+            "userFunding",
+            user,
+            start,
+            parsing.parse_funding_events,
+            key=lambda e: (e.hash, e.coin),
+            time_of=lambda e: e.time,
+        )
+
+    async def get_ledger(self, user: str, start: datetime) -> list[LedgerEvent]:
+        return await self._events_by_time(
+            "userNonFundingLedgerUpdates",
+            user,
+            start,
+            parsing.parse_ledger_events,
+            key=lambda e: (e.hash, e.delta_type),
+            time_of=lambda e: e.time,
+        )
 
     async def get_active_asset_data(self, user: str, coin: str) -> ActiveAssetData:
         data = await self._client.post(

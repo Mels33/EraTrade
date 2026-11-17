@@ -40,6 +40,26 @@ services:
       driver: json-file
       options: {max-size: "20m", max-file: "5"}
 
+  # Периодическая сверка с биржей (§11 плана): раз в минуту. Ключ API-кошелька не нужен —
+  # только чтение биржи; критичное расхождение блокирует входы и ставит LIVE_PAUSED.
+  reconciler-mainnet:
+    build: .
+    container_name: eratrade-reconciler-mainnet
+    profiles: ["collector"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env.mainnet
+    environment:
+      DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
+      ERATRADE_ENV_FILE: /nonexistent
+    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade reconcile --every 60"]
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
   # Ежедневные бэкапы обеих БД в ./backups (хранение 14 дней).
   pg-backup:
     image: postgres:17

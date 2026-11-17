@@ -42,6 +42,8 @@ class FakeHyperliquid:
         self.next_oid = 1000
         self.next_tid = 1
         self.exchange_actions: list[dict[str, Any]] = []
+        self.funding: list[dict[str, Any]] = []
+        self.ledger: list[dict[str, Any]] = []
         # Сбои и особые ответы.
         self.fail_next: str | None = None
         self.reject_next_order: str | None = None
@@ -111,6 +113,10 @@ class FakeHyperliquid:
             }
         if t == "userFillsByTime":
             return [f for f in self.fills if f["time"] >= p["startTime"]]
+        if t == "userFunding":
+            return [e for e in self.funding if e["time"] >= p["startTime"]]
+        if t == "userNonFundingLedgerUpdates":
+            return [e for e in self.ledger if e["time"] >= p["startTime"]]
         if t == "userRole":
             if p["user"] == self.signer:
                 return {"role": "agent", "data": {"user": self.account}}
@@ -283,6 +289,10 @@ class FakeHyperliquid:
         self.position += size if is_buy else -size
         if self.position == 0:
             self.entry_px = None
+            # Как на mainnet: при обнулении позиции биржа снимает reduce-only ордера.
+            for other in self.orders.values():
+                if other["status"] == "open" and other["reduce_only"]:
+                    other["status"] = "reduceOnlyCanceled"
         elif start == 0:
             self.entry_px = px
         fill = {
@@ -315,3 +325,51 @@ class FakeHyperliquid:
                 order["status"] = "filled"
                 order["remaining"] = Decimal(0)
                 self._fill(order["oid"], order["cloid"], order["is_buy"], size, self.bid)
+
+    # --- события вне бота ---
+
+    def manual_fill(self, *, is_buy: bool, size: Decimal) -> None:
+        """Сделка через интерфейс биржи (без cloid бота)."""
+        oid = self._new_order(
+            {"b": is_buy, "p": str(self.mid), "s": str(size), "r": False},
+            is_trigger=False,
+            status="filled",
+        )
+        self.orders[oid]["remaining"] = Decimal(0)
+        self._fill(oid, None, is_buy, size, self.ask if is_buy else self.bid)
+
+    def external_stop(self, *, is_buy: bool, size: Decimal, trigger: str) -> int:
+        """Стоп, поставленный не ботом (или чья локальная запись потеряна)."""
+        oid = self._new_order(
+            {"b": is_buy, "p": trigger, "s": str(size), "r": True}, is_trigger=True, status="open"
+        )
+        self.orders[oid]["trigger_px"] = trigger
+        return oid
+
+    def exchange_cancels(self, oid: int, status: str = "marginCanceled") -> None:
+        self.orders[oid]["status"] = status
+
+    def add_funding(self, usdc: str) -> None:
+        self.funding.append(
+            {
+                "time": self.now_ms,
+                "hash": "0x" + f"{len(self.funding) + 1:064x}",
+                "delta": {
+                    "type": "funding",
+                    "coin": "BTC",
+                    "usdc": usdc,
+                    "szi": str(self.position),
+                    "fundingRate": "0.0000125",
+                    "nSamples": None,
+                },
+            }
+        )
+
+    def add_deposit(self, usdc: str) -> None:
+        self.ledger.append(
+            {
+                "time": self.now_ms,
+                "hash": "0x" + f"{len(self.ledger) + 100:064x}",
+                "delta": {"type": "deposit", "usdc": usdc},
+            }
+        )

@@ -156,3 +156,23 @@ class BestBidAsk:
     @property
     def spread_bps(self) -> Decimal:
         return (self.ask - self.bid) / self.mid * 10_000
+
+
+@dataclass(frozen=True, slots=True)
+class FundingEvent:
+    hash: str
+    coin: str
+    time: datetime
+    usdc: Decimal  # > 0 получено, < 0 уплачено
+    position_size: Decimal
+    funding_rate: Decimal
+    raw: dict[str, Any] = field(compare=False, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerEvent:
+    hash: str
+    delta_type: str  # deposit, withdraw, send, accountClassTransfer, ...
+    time: datetime
+    usdc: Decimal | None
+    raw: dict[str, Any] = field(compare=False, repr=False)

@@ -6,7 +6,6 @@
 """
 
 import asyncio
-import os
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
@@ -20,12 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from app.config.settings import get_settings
+from tests.db.constants import TEST_DB_URL
 
 ROOT = Path(__file__).resolve().parents[2]
-TEST_DB_URL = os.environ.get(
-    "ERATRADE_TEST_DATABASE_URL",
-    "postgresql+asyncpg://eratrade:eratrade_local@127.0.0.1:5435/eratrade_pytest_testnet",
-)
 
 
 async def _recreate_database(url: str) -> None:
@@ -109,3 +105,7 @@ async def committing_sessionmaker(
         async with engine.begin() as conn:
             await conn.execute(truncate)
         await engine.dispose()
+
+
+# Общее окружение торговых тестов (симулятор биржи + движок): регистрируем фикстуру `env`.
+from tests.db.trading_env import env  # noqa: E402, F401

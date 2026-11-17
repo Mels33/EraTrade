@@ -39,6 +39,11 @@ from app.market_data.collector import CollectorConfig, MarketDataCollector, floo
 from app.market_data.gaps import compress_ranges
 from app.market_data.metadata import sync_market
 from app.observability.logging import configure_logging, correlation_scope
+from app.reconciliation.reconciler import (
+    Reconciler,
+    ReconciliationReport,
+    Severity,
+)
 
 # show_locals=False: локальные переменные (настройки, ключи) не печатаются в трейсбеке.
 app = typer.Typer(no_args_is_help=True, add_completion=False, pretty_exceptions_show_locals=False)
@@ -562,6 +567,112 @@ def _print_trade(result: TradeResult) -> None:
         typer.secho(warning, fg=typer.colors.RED, bold=True)
 
 
+def _print_report(report: ReconciliationReport) -> None:
+    color = {"ok": typer.colors.GREEN, "warnings": typer.colors.YELLOW}.get(
+        report.status, typer.colors.RED
+    )
+    typer.secho(
+        f"Сверка #{report.run_id}: {report.status.upper()} · позиция на бирже "
+        f"{report.exchange_position}, ожидаемая {report.expected_position}",
+        fg=color,
+        bold=True,
+    )
+    marks = {Severity.INFO: "·", Severity.WARNING: "!", Severity.CRITICAL: "✖"}
+    for diff in report.differences:
+        repaired = " (исправлено)" if diff.repaired else ""
+        typer.echo(f"  {marks[diff.severity]} {diff.message}{repaired}")
+    if report.entries_blocked:
+        typer.secho("Новые входы заблокированы", fg=typer.colors.RED)
+
+
+async def _pre_trade_reconcile(engine: ExecutionEngine) -> ReconciliationReport:
+    reconciler = Reconciler(
+        engine.gateway,
+        engine.sm,
+        engine.tracker,
+        network=engine.network,
+        market_id=engine.market_id,
+        coin=engine.coin,
+        user=engine.user,
+    )
+    report = await reconciler.run("pre_trade")
+    _print_report(report)
+    return report
+
+
+async def _with_reconciler[T](settings: Settings, fn: Callable[[Reconciler], Awaitable[T]]) -> T:
+    if settings.hl_account_address is None:
+        raise typer.BadParameter("не задан HL_ACCOUNT_ADDRESS")
+    strategy = load_strategy(settings.strategy_config_path)
+    engine = create_engine(settings)
+    try:
+        async with open_gateway(settings) as gw:
+            reconciler = await Reconciler.create(
+                gw, create_sessionmaker(engine), strategy, user=settings.hl_account_address
+            )
+            return await fn(reconciler)
+    finally:
+        await engine.dispose()
+
+
+@app.command("reconcile")
+def reconcile(
+    every: int = typer.Option(0, help="Повторять каждые N секунд (0 — один раз)"),
+) -> None:
+    """Сверить локальное состояние с биржей. Ключ API-кошелька не нужен."""
+    settings = _load_settings()
+    configure_logging(settings, service="reconciler")
+
+    async def _once(reconciler: Reconciler) -> None:
+        if every > 0:
+            await reconciler.run_forever(every)
+        else:
+            with correlation_scope():
+                _print_report(await reconciler.run("manual"))
+
+    try:
+        asyncio.run(_with_reconciler(settings, _once))
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        typer.echo("Сверка остановлена")
+
+
+@app.command("accept-position")
+def accept_position(
+    reason: str = typer.Option(..., "--reason", "-r", help="Почему позиция изменилась вне бота"),
+) -> None:
+    """Признать текущую позицию на бирже точкой отсчёта (после ручной сделки)."""
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+
+    async def _accept(reconciler: Reconciler) -> Decimal:
+        return await reconciler.accept_exchange_position(actor=_operator(), reason=reason)
+
+    size = asyncio.run(_with_reconciler(settings, _accept))
+    typer.echo(f"Точка отсчёта: позиция {size}. Запрет входов снимается отдельно: eratrade unblock")
+
+
+@app.command("unblock")
+def unblock(
+    reason: str = typer.Option(..., "--reason", "-r", help="Причина (попадёт в аудит)"),
+) -> None:
+    """Снять запрет новых входов (только оператор, после разбора причины)."""
+    settings = _load_settings()
+
+    async def _unblock(session: AsyncSession) -> tuple[bool, str | None]:
+        state = await control.ensure_bot_state(session, settings.network)
+        previous = state.block_reason
+        changed = await control.unblock_entries(
+            session, settings.network, actor=_operator(), reason=reason
+        )
+        return changed, previous
+
+    changed, previous = _run_in_transaction(settings, _unblock)
+    if changed:
+        typer.secho(f"Запрет снят (был: {previous})", fg=typer.colors.GREEN)
+    else:
+        typer.echo("Запрета не было")
+
+
 @app.command("open")
 def open_position(
     direction: str = typer.Argument(..., help="long или short"),
@@ -576,6 +687,9 @@ def open_position(
     side = Side.BUY if direction == "long" else Side.SELL
 
     async def _open(engine: ExecutionEngine) -> TradeResult:
+        report = await _pre_trade_reconcile(engine)
+        if report.critical:
+            return TradeResult(None, warnings=["вход отменён: сверка нашла критичные расхождения"])
         return await engine.open_position(
             side, notional, confirm=_make_confirm(settings), stop_price=stop_price
         )
@@ -590,6 +704,7 @@ def close_position() -> None:
     configure_logging(settings, service="cli")
 
     async def _close(engine: ExecutionEngine) -> TradeResult:
+        await _pre_trade_reconcile(engine)  # закрытие разрешено и при расхождениях
         return await engine.close_position(confirm=_make_confirm(settings))
 
     _print_trade(asyncio.run(_with_engine(settings, _close)))
