@@ -26,7 +26,7 @@ from app.domain.account import (
     Side,
     UserRole,
 )
-from app.domain.market import AssetContext, Candle, DataSource, MarketMeta
+from app.domain.market import AssetContext, Candle, DataSource, FundingPoint, MarketMeta
 from app.integrations.hyperliquid.errors import HyperliquidFormatError
 
 ISOLATED_ONLY_MARGIN_MODES = frozenset({"strictIsolated", "noCross"})
@@ -519,6 +519,26 @@ def parse_funding_events(data: Any) -> list[FundingEvent]:
             )
         )
     return events
+
+
+def parse_funding_history(data: Any, *, coin: str) -> list[FundingPoint]:
+    """fundingHistory: почасовые ставки рынка, по возрастанию времени."""
+    if data is None:
+        raise HyperliquidFormatError(f"fundingHistory {coin}: null (неизвестный инструмент?)")
+    points = []
+    for i, item in enumerate(_list(data, "fundingHistory")):
+        what = f"fundingHistory[{i}]"
+        e = _obj(item, what)
+        if _str(e, "coin", what) != coin:
+            raise HyperliquidFormatError(f"fundingHistory: чужая монета {e.get('coin')}")
+        points.append(
+            FundingPoint(
+                time=_time(e, "time", what),
+                funding_rate=_dec(e, "fundingRate", what),
+                premium=_dec(e, "premium", what),
+            )
+        )
+    return sorted(points, key=lambda p: p.time)
 
 
 def parse_ledger_events(data: Any) -> list[LedgerEvent]:

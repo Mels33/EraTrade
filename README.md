@@ -127,6 +127,21 @@ ERATRADE_ENV_FILE=$E uv run eratrade kill -r "..."                   # pause →
 - второй торговый процесс с тем же API-кошельком не запустится (advisory lock);
 - при старте проверяются роль ключа (agent, не основной кошелёк), срок действия, часы (±2 с).
 
+## Признаки и обучающий набор (этап 10)
+
+```bash
+export ERATRADE_ENV_FILE=.env.mainnet
+uv run eratrade features                 # вектор признаков на последнюю закрытую свечу + хеш входа
+uv run eratrade features --at 2026-11-17T12:00   # на конкретный момент решения
+uv run eratrade dataset                  # набор в data/datasets/<сеть>-BTC-1h-v1-<время>/
+```
+
+`dataset` строит признаки и target (порог из `[target]` в `config/strategy.toml`), делит
+строки по времени на train / validation / calibration / test с purge-промежутком в горизонт
+и пишет `dataset.csv` + `manifest.json` (версия признаков, хеш кода pipeline, параметры
+target, распределение классов, baseline log loss / Brier, sha256 исходных данных и набора).
+Funding копит коллектор; история загружается `eratrade backfill --hours 5100`.
+
 ## Проверки
 
 ```bash

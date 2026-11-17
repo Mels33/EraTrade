@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from app.config.settings import Network
 from app.integrations.hyperliquid.errors import HyperliquidFormatError, UnknownMarketError
 from app.integrations.hyperliquid.gateway import (
     FILLS_PAGE_LIMIT,
+    FUNDING_PAGE_LIMIT,
     HyperliquidGateway,
     normalize_address,
 )
@@ -148,3 +150,35 @@ async def test_invalid_cloid_rejected() -> None:
     gw = make_gateway(FakeExchange(lambda p: {}), T0)
     with pytest.raises(ValueError, match="cloid"):
         await gw.get_order_status(USER, "0x123")
+
+
+def raw_funding(time: datetime, coin: str = "BTC") -> dict[str, Any]:
+    return {
+        "coin": coin,
+        "fundingRate": "0.0000125",
+        "premium": "-0.0003",
+        "time": datetime_to_ms(time) + 45,
+    }
+
+
+async def test_funding_history_paginates() -> None:
+    history = [raw_funding(T0 + i * H) for i in range(FUNDING_PAGE_LIMIT + 7)]
+
+    def handler(payload: dict[str, Any]) -> Any:
+        assert payload["type"] == "fundingHistory" and payload["coin"] == "BTC"
+        page = [f for f in history if f["time"] >= payload["startTime"]]
+        return page[:FUNDING_PAGE_LIMIT]
+
+    exchange = FakeExchange(handler)
+    points = await make_gateway(exchange, T0 + 600 * H).get_funding_history("BTC", T0)
+    assert len(points) == FUNDING_PAGE_LIMIT + 7 and len(exchange.payloads) == 2
+    assert points[0].funding_rate == Decimal("0.0000125") and points[0].premium == Decimal(
+        "-0.0003"
+    )
+    assert [p.time for p in points] == sorted({p.time for p in points})
+
+
+async def test_funding_history_rejects_foreign_coin() -> None:
+    exchange = FakeExchange(lambda payload: [raw_funding(T0, coin="ETH")])
+    with pytest.raises(HyperliquidFormatError, match="чужая монета"):
+        await make_gateway(exchange, T0 + H).get_funding_history("BTC", T0)

@@ -63,6 +63,7 @@ class CollectorConfig:
     rest_sync_interval: float = 60.0
     close_grace: float = 3.0  # пауза после смены свечи перед REST-финализацией
     ctx_sample_interval: float = 60.0
+    funding_sync_interval: float = 300.0  # funding начисляется раз в час
     heartbeat_interval: float = 15.0
     meta_refresh_interval: float = 3600.0
     max_ws_silence: float = 30.0
@@ -79,6 +80,7 @@ class CollectorHealth:
     last_ws_message_at: datetime | None = None
     last_rest_sync_at: datetime | None = None
     last_closed_open_time: datetime | None = None
+    last_funding_time: datetime | None = None
     reconnects: int = 0
     last_error: str | None = None
     last_ctx: AssetContext | None = field(default=None, repr=False)
@@ -93,6 +95,9 @@ class CollectorHealth:
             "last_rest_sync_age_s": age(self.last_rest_sync_at),
             "last_closed_open_time": (
                 self.last_closed_open_time.isoformat() if self.last_closed_open_time else None
+            ),
+            "last_funding_time": (
+                self.last_funding_time.isoformat() if self.last_funding_time else None
             ),
             "reconnects": self.reconnects,
             "last_error": self.last_error,
@@ -141,6 +146,7 @@ class MarketDataCollector:
         ):
             await self.refresh_meta()
             await self.sync_candles()
+            await self._guarded(self.sync_funding)
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self._ws_loop())
             tg.create_task(self._rest_sync_loop())
@@ -151,6 +157,7 @@ class MarketDataCollector:
                 self._every(self.config.heartbeat_interval, self.heartbeat, immediate=True)
             )
             tg.create_task(self._every(self.config.meta_refresh_interval, self.refresh_meta))
+            tg.create_task(self._every(self.config.funding_sync_interval, self.sync_funding))
 
     async def _every(
         self,
@@ -231,6 +238,26 @@ class MarketDataCollector:
             except TimeoutError:
                 pass
             await self._guarded(self.sync_candles)
+
+    async def sync_funding(self) -> int:
+        """Почасовой funding рынка (признаки модели): догрузка с последней записи в БД
+        или за то же окно, что и backfill свечей."""
+        market_id = self._require_market()
+        async with self._sessionmaker() as session:
+            last = await market_repo.get_last_funding_time(session, market_id)
+        start = (
+            last + timedelta(milliseconds=1)
+            if last is not None
+            else floor_time(self._clock(), self._step) - self._step * self.config.backfill_candles
+        )
+        points = await self._gateway.get_funding_history(self.config.coin, start)
+        async with self._sessionmaker.begin() as session:
+            written = await market_repo.upsert_funding_history(session, market_id, points)
+        if points:
+            self.health.last_funding_time = points[-1].time
+        elif last is not None:
+            self.health.last_funding_time = last
+        return written
 
     # --- контекст рынка ---
 

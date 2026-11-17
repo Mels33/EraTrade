@@ -16,3 +16,4 @@ scripts
 .ruff_cache
 *.md
 !README.md
+data/

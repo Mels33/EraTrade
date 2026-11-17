@@ -13,7 +13,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config.settings import Network
-from app.db.models import CandleRecord, HeartbeatRecord, MarketContextSnapshotRecord
+from app.db.models import (
+    CandleRecord,
+    FundingHistoryRecord,
+    HeartbeatRecord,
+    MarketContextSnapshotRecord,
+)
 from app.integrations.hyperliquid.gateway import HyperliquidGateway
 from app.integrations.hyperliquid.info_client import InfoClient
 from app.integrations.hyperliquid.parsing import datetime_to_ms
@@ -77,7 +82,20 @@ class FakeExchange:
             req = payload["req"]
             page = [c for c in self.candles() if req["startTime"] <= c["t"] <= req["endTime"]]
             return httpx.Response(200, json=page)
+        if payload["type"] == "fundingHistory":
+            page = [f for f in self.funding() if f["time"] >= payload["startTime"]]
+            return httpx.Response(200, json=page[:500])
         return httpx.Response(422)
+
+    def funding(self) -> list[dict[str, Any]]:
+        result, t = [], self.history_start + H
+        while t <= self.clock.now:
+            ms = int(t.timestamp() * 1000) + 45
+            result.append(
+                {"coin": "BTC", "fundingRate": "0.0000125", "premium": "0.0001", "time": ms}
+            )
+            t += H
+        return result
 
 
 class FakeWs:
@@ -197,6 +215,24 @@ async def test_backfill_then_incremental_sync(
 
     await collector.sync_candles()  # повтор ничего не дублирует
     assert await count(sm, CandleRecord) == 26
+
+
+async def test_funding_backfill_then_incremental(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    sm = committing_sessionmaker
+    clock = Clock(T0 + 30 * H + timedelta(minutes=20))
+    collector = make_collector(sm, FakeExchange(clock, history_start=T0))
+    await collector.refresh_meta()
+
+    # backfill_candles=24: funding с начала окна backfill свечей (T0+6h) — 25 начислений
+    assert await collector.sync_funding() == 25
+    assert collector.health.last_funding_time == T0 + 30 * H + timedelta(milliseconds=45)
+    assert await collector.sync_funding() == 0  # ничего нового — ничего не пишется
+
+    clock.now += 2 * H
+    assert await collector.sync_funding() == 2
+    assert await count(sm, FundingHistoryRecord) == 27
 
 
 async def test_websocket_lifecycle_rollover_and_reconnect(

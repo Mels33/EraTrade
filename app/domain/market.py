@@ -90,3 +90,15 @@ class AssetContext:
         _require_aware("received_at", self.received_at)
         if self.exchange_time is not None:
             _require_aware("exchange_time", self.exchange_time)
+
+
+@dataclass(frozen=True, slots=True)
+class FundingPoint:
+    """Почасовой funding рынка (fundingHistory): ставка за час и premium (базис к oracle)."""
+
+    time: datetime
+    funding_rate: Decimal
+    premium: Decimal
+
+    def __post_init__(self) -> None:
+        _require_aware("time", self.time)

@@ -10,7 +10,12 @@ from app.db.models.control import (
     HeartbeatRecord,
     NonceStateRecord,
 )
-from app.db.models.market import CandleRecord, MarketContextSnapshotRecord, MarketRecord
+from app.db.models.market import (
+    CandleRecord,
+    FundingHistoryRecord,
+    MarketContextSnapshotRecord,
+    MarketRecord,
+)
 from app.db.models.reconciliation import (
     FundingEventRecord,
     LedgerEventRecord,
@@ -34,6 +39,7 @@ __all__ = [
     "CandleRecord",
     "FillRecord",
     "FundingEventRecord",
+    "FundingHistoryRecord",
     "HeartbeatRecord",
     "LedgerEventRecord",
     "MarketContextSnapshotRecord",

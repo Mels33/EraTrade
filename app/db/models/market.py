@@ -96,3 +96,15 @@ class MarketContextSnapshotRecord(Base):
     impact_ask_price: Mapped[Decimal | None]
     source: Mapped[str]
     raw: Mapped[dict[str, Any] | None]
+
+
+class FundingHistoryRecord(Base):
+    """Почасовой funding рынка (fundingHistory). time — момент начисления на бирже."""
+
+    __tablename__ = "funding_history"
+
+    market_id: Mapped[int] = mapped_column(ForeignKey("markets.id"), primary_key=True)
+    time: Mapped[datetime] = mapped_column(primary_key=True)
+    funding_rate: Mapped[Decimal]
+    premium: Mapped[Decimal]
+    received_at: Mapped[datetime] = mapped_column(server_default=func.now())

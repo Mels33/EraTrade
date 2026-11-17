@@ -58,3 +58,14 @@ address_requests_warning = 1000
 enabled = false
 horizon_seconds = 120
 refresh_seconds = 30
+
+[target]
+# Разметка обучающего набора (docs/spec.md §8). Горизонт — market.horizon_candles.
+# UP: доходность за горизонт > порога; DOWN: < -порога; иначе FLAT.
+# Порог = издержки туда-обратно + запас + минимальный край.
+taker_fee_bps = "4.5"          # taker-комиссия базового уровня, за сторону
+expected_spread_bps = "1"      # спред BTC, один раз за сделку
+expected_slippage_bps = "2"    # за сторону (лимит — limits.max_slippage_bps)
+expected_funding_bps = "0.5"   # ~0.00125%/ч × 4 ч
+safety_margin_bps = "5"
+min_edge_bps = "20"

@@ -77,6 +77,31 @@ class DeadMansSwitchConfig(_Frozen):
         return self
 
 
+class TargetConfig(_Frozen):
+    """Разметка обучающего набора (§14.2): порог класса = издержки сделки + запас + край."""
+
+    taker_fee_bps: Decimal = Field(ge=0)  # за одну сторону
+    expected_spread_bps: Decimal = Field(ge=0)  # полный спред, платится один раз за сделку
+    expected_slippage_bps: Decimal = Field(ge=0)  # за одну сторону
+    expected_funding_bps: Decimal = Field(ge=0)  # за горизонт
+    safety_margin_bps: Decimal = Field(ge=0)
+    min_edge_bps: Decimal = Field(gt=0)
+
+    @property
+    def cost_bps(self) -> Decimal:
+        """Ожидаемые издержки сделки туда-обратно."""
+        return (
+            2 * self.taker_fee_bps
+            + self.expected_spread_bps
+            + 2 * self.expected_slippage_bps
+            + self.expected_funding_bps
+        )
+
+    @property
+    def threshold_bps(self) -> Decimal:
+        return self.cost_bps + self.safety_margin_bps + self.min_edge_bps
+
+
 class StrategyConfig(_Frozen):
     spec_version: int
     market: MarketConfig
@@ -87,6 +112,7 @@ class StrategyConfig(_Frozen):
     execution: ExecutionConfig
     risk: RiskConfig
     dead_mans_switch: DeadMansSwitchConfig
+    target: TargetConfig
 
     @model_validator(mode="after")
     def _check_cross_fields(self) -> "StrategyConfig":

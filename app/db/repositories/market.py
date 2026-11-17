@@ -9,11 +9,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
 from app.config.settings import Network
-from app.db.models import CandleRecord, MarketContextSnapshotRecord, MarketRecord
-from app.domain.market import AssetContext, Candle, MarketMeta
+from app.db.models import (
+    CandleRecord,
+    FundingHistoryRecord,
+    MarketContextSnapshotRecord,
+    MarketRecord,
+)
+from app.domain.market import AssetContext, Candle, FundingPoint, MarketMeta
 
 # 14 параметров на свечу; у PostgreSQL предел 32767 параметров на запрос.
 CANDLE_BATCH_SIZE = 1000
+FUNDING_BATCH_SIZE = 5000
 
 
 async def upsert_market(session: AsyncSession, meta: MarketMeta) -> int:
@@ -232,3 +238,60 @@ async def candle_stats(
     )
     count, first, last = (await session.execute(stmt)).one()
     return int(count), first, last
+
+
+# --- funding рынка ---
+
+
+async def upsert_funding_history(
+    session: AsyncSession, market_id: int, points: Sequence[FundingPoint]
+) -> int:
+    """Идемпотентная запись почасового funding. Возвращает число новых/изменённых строк."""
+    written = 0
+    for i in range(0, len(points), FUNDING_BATCH_SIZE):
+        rows = [
+            {
+                "market_id": market_id,
+                "time": p.time,
+                "funding_rate": p.funding_rate,
+                "premium": p.premium,
+            }
+            for p in points[i : i + FUNDING_BATCH_SIZE]
+        ]
+        insert_stmt = insert(FundingHistoryRecord).values(rows)
+        excluded = insert_stmt.excluded
+        stmt = insert_stmt.on_conflict_do_update(
+            index_elements=["market_id", "time"],
+            set_={"funding_rate": excluded.funding_rate, "premium": excluded.premium},
+            where=(FundingHistoryRecord.funding_rate != excluded.funding_rate)
+            | (FundingHistoryRecord.premium != excluded.premium),
+        ).returning(FundingHistoryRecord.time)
+        written += len((await session.execute(stmt)).all())
+    return written
+
+
+async def get_funding_history(
+    session: AsyncSession,
+    market_id: int,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> list[FundingPoint]:
+    """Funding по возрастанию времени в полуинтервале [start, end)."""
+    stmt = select(FundingHistoryRecord).where(FundingHistoryRecord.market_id == market_id)
+    if start is not None:
+        stmt = stmt.where(FundingHistoryRecord.time >= start)
+    if end is not None:
+        stmt = stmt.where(FundingHistoryRecord.time < end)
+    stmt = stmt.order_by(FundingHistoryRecord.time)
+    return [
+        FundingPoint(time=r.time, funding_rate=r.funding_rate, premium=r.premium)
+        for r in (await session.execute(stmt)).scalars()
+    ]
+
+
+async def get_last_funding_time(session: AsyncSession, market_id: int) -> datetime | None:
+    stmt = select(func.max(FundingHistoryRecord.time)).where(
+        FundingHistoryRecord.market_id == market_id
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()

@@ -24,7 +24,7 @@ from app.domain.account import (
     RateLimitStatus,
     UserRole,
 )
-from app.domain.market import AssetContext, Candle, MarketMeta
+from app.domain.market import AssetContext, Candle, FundingPoint, MarketMeta
 from app.integrations.hyperliquid import parsing
 from app.integrations.hyperliquid.errors import HyperliquidFormatError, UnknownMarketError
 from app.integrations.hyperliquid.info_client import InfoClient
@@ -40,6 +40,7 @@ INTERVALS: dict[str, timedelta] = {
 }
 FILLS_PAGE_LIMIT = 2000  # userFillsByTime отдаёт не больше 2000 исполнений за запрос
 EVENTS_PAGE_LIMIT = 500  # userFunding / userNonFundingLedgerUpdates
+FUNDING_PAGE_LIMIT = 500  # fundingHistory рынка
 DEFAULT_CLOSE_GRACE = timedelta(seconds=10)
 
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -129,6 +130,32 @@ class HyperliquidGateway:
             next_cursor = page[-1].open_time + step
             if next_cursor <= cursor:
                 raise HyperliquidFormatError("candleSnapshot: пагинация не продвигается")
+            cursor = next_cursor
+        return [result[t] for t in sorted(result)]
+
+    async def get_funding_history(
+        self, coin: str, start: datetime, end: datetime | None = None
+    ) -> list[FundingPoint]:
+        """Почасовой funding рынка с time в [start, end], с постраничной догрузкой."""
+        result: dict[datetime, FundingPoint] = {}
+        cursor = start
+        while True:
+            payload: dict[str, object] = {
+                "type": "fundingHistory",
+                "coin": coin,
+                "startTime": parsing.datetime_to_ms(cursor),
+            }
+            if end is not None:
+                payload["endTime"] = parsing.datetime_to_ms(end)
+            page = parsing.parse_funding_history(await self._client.post(payload), coin=coin)
+            page = [p for p in page if p.time >= start and (end is None or p.time <= end)]
+            for point in page:
+                result[point.time] = point
+            if len(page) < FUNDING_PAGE_LIMIT:
+                break
+            next_cursor = page[-1].time + timedelta(milliseconds=1)
+            if next_cursor <= cursor:
+                raise HyperliquidFormatError("fundingHistory: пагинация не продвигается")
             cursor = next_cursor
         return [result[t] for t in sorted(result)]
 

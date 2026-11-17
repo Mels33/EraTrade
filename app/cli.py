@@ -329,7 +329,7 @@ def backfill(
         ..., help="Сколько часов истории загрузить (биржа хранит ~5000 свечей)"
     ),
 ) -> None:
-    """Догрузить окно свечей через REST (идемпотентно; закрытые свечи не перезаписываются)."""
+    """Догрузить окно свечей и funding через REST (идемпотентно)."""
     settings = _load_settings()
     configure_logging(settings, service="cli")
     strategy = load_strategy(settings.strategy_config_path)
@@ -341,9 +341,14 @@ def backfill(
             async with open_gateway(settings) as gw:
                 start = datetime.now(UTC) - timedelta(hours=hours)
                 candles = await gw.get_candles(coin, interval, start=start)
+                funding = await gw.get_funding_history(coin, start - timedelta(hours=26))
                 async with create_sessionmaker(engine).begin() as session:
                     market_id, _, _ = await sync_market(gw, session, coin)
                     written = await market_repo.upsert_candles(session, market_id, candles)
+                    funding_written = await market_repo.upsert_funding_history(
+                        session, market_id, funding
+                    )
+                typer.echo(f"Funding: получено {len(funding)}, записано {funding_written}")
                 return len(candles), written
         finally:
             await engine.dispose()
@@ -405,6 +410,13 @@ def data_status(
                 f"Последний снимок контекста: {age:.0f} с назад ({ctx.source}), "
                 f"funding={ctx.funding}, OI={ctx.open_interest}"
             )
+
+        last_funding = await market_repo.get_last_funding_time(session, record.id)
+        if last_funding is None:
+            typer.secho("Истории funding нет (eratrade backfill)", fg=typer.colors.YELLOW)
+        else:
+            age_min = (now - last_funding).total_seconds() / 60
+            typer.echo(f"Funding: последнее начисление {age_min:.0f} мин назад")
 
         heartbeat = next(
             (hb for hb in await control.get_heartbeats(session) if hb.component == COLLECTOR), None
@@ -946,6 +958,151 @@ def list_orders_cmd(limit: int = typer.Option(20, help="Сколько посл�
             )
 
     _run_in_transaction(settings, _list)
+
+
+# --- признаки и обучающий набор (этап 10) ---
+
+
+async def _market_id(session: AsyncSession, settings: Settings, coin: str) -> int:
+    record = await market_repo.get_market(session, settings.network, coin)
+    if record is None:
+        typer.secho("Рынка нет в БД — запустите коллектор", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    return record.id
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+@app.command("features")
+def features_cmd(
+    at: str | None = typer.Option(
+        None, help="Момент решения (конец свечи), ISO UTC; по умолчанию — последняя закрытая"
+    ),
+) -> None:
+    """Вектор признаков на момент решения и хеш входных данных."""
+    from app.features.loader import features_at
+    from app.features.pipeline import FeatureError
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin, interval = strategy.market.coin, strategy.market.interval
+
+    async def _show(session: AsyncSession) -> None:
+        market_id = await _market_id(session, settings, coin)
+        try:
+            inp, vector = await features_at(
+                session, market_id, interval, INTERVALS[interval], _parse_time(at)
+            )
+        except FeatureError as exc:
+            typer.secho(f"Признаки не посчитаны (решение было бы HOLD): {exc}", fg=typer.colors.RED)
+            raise typer.Exit(code=1) from None
+        typer.secho(
+            f"{coin} {interval} · признаки {vector.version} · решение в "
+            f"{vector.decision_time:%Y-%m-%d %H:%M} UTC",
+            bold=True,
+        )
+        for name, value in vector.as_dict().items():
+            typer.echo(f"  {name:<24} {value: .6g}")
+        typer.echo(f"Хеш входных данных: {inp.hash()}")
+
+    _run_in_transaction(settings, _show)
+
+
+@app.command("dataset")
+def dataset_cmd(
+    out: str = typer.Option("data/datasets", help="Каталог для наборов"),
+    start: str | None = typer.Option(None, help="Начало истории (ISO UTC)"),
+    end: str | None = typer.Option(None, help="Конец истории (ISO UTC, исключительно)"),
+    fractions: str = typer.Option(
+        "0.6,0.15,0.1,0.15", help="Доли train,validation,calibration,test"
+    ),
+) -> None:
+    """Построить обучающий набор: признаки + target, хронологическое разбиение, манифест."""
+    from pathlib import Path
+
+    from app.features.dataset import (
+        TargetParams,
+        build_dataset,
+        chronological_split,
+        write_dataset,
+    )
+    from app.features.loader import load_history
+    from app.features.pipeline import FEATURE_SET_VERSION
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin, interval = strategy.market.coin, strategy.market.interval
+    step = INTERVALS[interval]
+    try:
+        parts_fractions = tuple(float(x) for x in fractions.split(","))
+    except ValueError:
+        typer.secho("fractions: четыре числа через запятую", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from None
+
+    async def _load(session: AsyncSession) -> tuple[list, list]:  # type: ignore[type-arg]
+        market_id = await _market_id(session, settings, coin)
+        return await load_history(
+            session, market_id, interval, start=_parse_time(start), end=_parse_time(end)
+        )
+
+    candles, funding = _run_in_transaction(settings, _load)
+    target = TargetParams(
+        horizon_candles=strategy.market.horizon_candles,
+        threshold_bps=strategy.target.threshold_bps,
+        cost_bps=strategy.target.cost_bps,
+    )
+    dataset = build_dataset(candles, funding, target, step=step)
+    if not dataset.rows:
+        typer.secho("Набор пуст — мало данных", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    parts = chronological_split(dataset.rows, step * target.horizon_candles, parts_fractions)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    name = f"{settings.network.value}-{coin}-{interval}-{FEATURE_SET_VERSION}-{stamp}"
+    out_dir = Path(out) / name
+    _, manifest = write_dataset(
+        dataset,
+        parts,
+        out_dir,
+        market={"network": settings.network.value, "coin": coin, "interval": interval},
+        project_root=Path(__file__).resolve().parents[1],
+    )
+
+    typer.secho(f"Набор: {out_dir}", bold=True)
+    typer.echo(
+        f"Свечей {dataset.source_candles}, funding {dataset.source_funding} → строк "
+        f"{len(dataset.rows)}; пропущено {dict(dataset.skipped) or 0}, "
+        f"в purge-промежутках {manifest['purged_rows']}"
+    )
+    typer.echo(
+        f"Target: горизонт {target.horizon_candles} св., порог ±{target.threshold_bps} bp "
+        f"(издержки {target.cost_bps} bp)"
+    )
+    typer.echo(
+        f"{'участок':<12}{'строк':>6}  {'период':<35}{'DOWN':>7}{'FLAT':>7}{'UP':>7}"
+        f"{'baseline logloss':>18}{'brier':>8}"
+    )
+    for name, info in manifest["splits"].items():
+        dist = info["class_distribution"]
+        period = f"{(info['start'] or '')[:16]} … {(info['end'] or '')[:16]}"
+        base = info.get("baseline_prior")
+        tail = f"{base['log_loss']:>18.4f}{base['brier']:>8.4f}" if base else ""
+        typer.echo(
+            f"{name:<12}{info['rows']:>6}  {period:<35}"
+            f"{dist['DOWN']:>7.1%}{dist['FLAT']:>7.1%}{dist['UP']:>7.1%}{tail}"
+        )
+    typer.echo(
+        "Средняя доходность за горизонт по классам (train): "
+        + ", ".join(
+            f"{k} {v:+.3%}"
+            for k, v in manifest["splits"]["train"]["mean_fwd_return_by_class"].items()
+        )
+    )
+    typer.echo(f"sha256 набора: {manifest['dataset_sha256']}")
 
 
 if __name__ == "__main__":
