@@ -1,4 +1,13 @@
-# Образ EraTrade (коллектор; позже — trader и API).
+# Образ EraTrade: коллектор, сверка, API с панелью (позже — trader).
+
+# Сборка панели (React) отдельным этапом: в итоговый образ попадает только dist.
+FROM node:22-slim AS frontend
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build
+
 FROM python:3.13-slim
 
 COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /usr/local/bin/uv
@@ -18,6 +27,7 @@ COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
 COPY config ./config
+COPY --from=frontend /frontend/dist ./frontend/dist
 RUN uv sync --frozen --no-dev
 
 RUN useradd --create-home --uid 10001 eratrade

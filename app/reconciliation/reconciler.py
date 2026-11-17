@@ -149,6 +149,7 @@ class Reconciler:
     ) -> "Reconciler":
         async with sessionmaker.begin() as db:
             market_id, meta, _ = await sync_market(gateway, db, strategy.market.coin)
+            await rec_repo.mark_abandoned_runs(db, market_id, clock())
         tracker = OrderTracker(
             gateway,
             sessionmaker,

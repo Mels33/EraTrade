@@ -77,6 +77,9 @@ class Settings(BaseSettings):
 
     logfire_token: SecretStr | None = None
 
+    # Токен оператора для API/панели (§13.1). Без него API не запускается.
+    api_token: SecretStr | None = None
+
     # Уведомления оператору (§12.3, §12.5). Без них — только лог.
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: str | None = None
@@ -151,6 +154,7 @@ class Settings(BaseSettings):
             "hl_account_address": self.hl_account_address,
             "api_wallet_key_configured": self.hl_api_wallet_private_key is not None,
             "logfire_token_configured": self.logfire_token is not None,
+            "api_token_configured": self.api_token is not None,
             "telegram_configured": self.telegram_bot_token is not None
             and bool(self.telegram_chat_id),
             "strategy_config_path": str(self.strategy_config_path),

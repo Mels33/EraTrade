@@ -1,5 +1,5 @@
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,7 +16,13 @@ MAINNET = Network.MAINNET
 
 
 async def _audit(session: AsyncSession) -> list[AuditLogRecord]:
-    stmt = select(AuditLogRecord).order_by(AuditLogRecord.id)
+    # audit_log нельзя очищать (append-only), поэтому берём только записи текущей транзакции:
+    # now() в PostgreSQL — время её начала, и все записи теста имеют именно его.
+    stmt = (
+        select(AuditLogRecord)
+        .where(AuditLogRecord.occurred_at >= func.now())
+        .order_by(AuditLogRecord.id)
+    )
     return list((await session.execute(stmt)).scalars())
 
 

@@ -60,6 +60,28 @@ services:
       driver: json-file
       options: {max-size: "20m", max-file: "5"}
 
+  # API и панель управления (§13). Порт опубликован только на 127.0.0.1.
+  # Ключ API-кошелька нужен только для cancel-all/flatten/kill; открыть позицию через API нельзя.
+  api-mainnet:
+    build: .
+    container_name: eratrade-api-mainnet
+    profiles: ["collector"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: [.env.mainnet, .env.mainnet.secrets]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
+      ERATRADE_ENV_FILE: /nonexistent
+    ports:
+      - "127.0.0.1:8000:8000"
+    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade api --host 0.0.0.0 --allow-external"]
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
   # Ежедневные бэкапы обеих БД в ./backups (хранение 14 дней).
   pg-backup:
     image: postgres:17

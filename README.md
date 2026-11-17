@@ -2,6 +2,19 @@
 
 AI-торговый бот для Hyperliquid (BTC perp, 1h). План: `План_разработки_AI-торгового_бота_Hyperliquid.md`, спецификация: `docs/spec.md`.
 
+## Запуск одной командой
+
+```bash
+scripts/eratrade.sh up        # БД + API с панелью + коллектор + сверка + бэкапы (Docker)
+scripts/eratrade.sh status    # контейнеры и сводка состояния бота
+scripts/eratrade.sh logs api-mainnet
+scripts/eratrade.sh down      # остановить всё (данные БД сохраняются)
+scripts/eratrade.sh dev       # разработка: БД в Docker, API и панель локально (http://127.0.0.1:5173)
+```
+
+Нужны `.env.mainnet` и `.env.mainnet.secrets`; если в секретах нет `API_TOKEN`, скрипт сгенерирует его.
+Панель: http://127.0.0.1:8000, вход — `API_TOKEN` из `.env.mainnet.secrets`.
+
 ## Быстрый старт (testnet, локально)
 
 ```bash
@@ -29,6 +42,19 @@ docker-compose --profile collector up -d --build
 docker logs -f eratrade-collector-mainnet
 ERATRADE_ENV_FILE=.env.mainnet uv run eratrade data-status
 ```
+
+## Панель управления (этап 9)
+
+Сервис `api-mainnet` (профиль `collector`) — FastAPI + React на http://127.0.0.1:8000
+(только локально; снаружи — через SSH-туннель или VPN). Вход — `API_TOKEN` из
+`.env.mainnet.secrets`. Документация API: http://127.0.0.1:8000/api/docs
+
+- Видно: сеть и режим, запрет входов и причина, heartbeat коллектора/сверки, свежесть данных,
+  результат сверки, equity, PnL дня/недели против лимитов, позиция и стоп, ордера, fills, аудит.
+- Команды: pause, снять запрет, flatten, cancel all, kill — с причиной, подтверждением
+  (ввод имени команды) и Idempotency-Key. Открыть позицию через панель нельзя.
+
+Разработка панели: `cd frontend && npm install && npm run dev` (проксирует /api на :8000).
 
 ## Управление (CLI)
 

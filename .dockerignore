@@ -6,6 +6,8 @@
 backups
 tests
 docs
+frontend/node_modules
+frontend/dist
 docker
 scripts
 **/__pycache__

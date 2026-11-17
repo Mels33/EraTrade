@@ -15,7 +15,7 @@ from app.domain.control import Actor, ActorKind
 from app.domain.orders import OrderKind, OrderPurpose, OrderStatus
 from app.execution.guard import ProposedOrder
 from app.reconciliation.reconciler import DiffKind, ReconciliationReport, Severity
-from tests.db.trading_env import OPERATOR, Env
+from tests.db.trading_env import NOW, OPERATOR, Env
 from tests.execution.fake_hyperliquid import SimulatedCrashError
 
 SIZE = Decimal("0.00023")
@@ -219,3 +219,18 @@ async def test_failed_run_is_recorded_as_error(env: Env) -> None:
             .first()
         )
     assert run is not None and run.status == "error" and "ValueError" in run.summary["error"]
+
+
+async def test_abandoned_running_run_is_marked_and_status_shows_finished(env: Env) -> None:
+    report = await env.reconciler().run("manual")
+    async with env.sm.begin() as db:
+        stale = await rec_repo.start_run(db, env.engine.market_id, "periodic")  # «убитый» прогон
+    async with env.sm() as db:
+        latest = await rec_repo.latest_run(db, env.engine.market_id, finished_only=True)
+    assert latest is not None and latest.id == report.run_id
+
+    async with env.sm.begin() as db:
+        assert await rec_repo.mark_abandoned_runs(db, env.engine.market_id, NOW) == 1
+    async with env.sm() as db:
+        record = await db.get(ReconciliationRunRecord, stale.id)
+    assert record is not None and record.status == "error"

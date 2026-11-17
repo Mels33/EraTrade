@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,14 +47,36 @@ async def finish_run(
     await session.flush()
 
 
-async def latest_run(session: AsyncSession, market_id: int) -> ReconciliationRunRecord | None:
+async def latest_run(
+    session: AsyncSession, market_id: int, *, finished_only: bool = False
+) -> ReconciliationRunRecord | None:
     stmt = (
         select(ReconciliationRunRecord)
         .where(ReconciliationRunRecord.market_id == market_id)
         .order_by(ReconciliationRunRecord.id.desc())
         .limit(1)
     )
+    if finished_only:
+        stmt = stmt.where(ReconciliationRunRecord.status != "running")
     return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def mark_abandoned_runs(session: AsyncSession, market_id: int, finished_at: datetime) -> int:
+    """Прогоны, оставшиеся в running после остановки процесса, помечаются как прерванные."""
+    stmt = (
+        update(ReconciliationRunRecord)
+        .where(
+            ReconciliationRunRecord.market_id == market_id,
+            ReconciliationRunRecord.status == "running",
+        )
+        .values(
+            status="error",
+            finished_at=finished_at,
+            summary={"error": "прерван: процесс сверки был остановлен во время прогона"},
+        )
+    )
+    result = await session.execute(stmt)
+    return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
 
 async def list_differences(

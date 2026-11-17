@@ -690,6 +690,32 @@ def unblock(
         typer.echo("Запрета не было")
 
 
+@app.command("api")
+def run_api(
+    host: str = typer.Option("127.0.0.1", help="Адрес (по умолчанию только локально)"),
+    port: int = typer.Option(8000),
+    allow_external: bool = typer.Option(
+        False, "--allow-external", help="Разрешить не-локальный адрес (только за VPN/прокси)"
+    ),
+) -> None:
+    """API и панель управления (§13). Нужен API_TOKEN; ключ — только для cancel/flatten/kill."""
+    import uvicorn
+
+    from app.api.app import create_api
+    from app.api.context import build_context
+
+    if host not in ("127.0.0.1", "localhost", "::1") and not allow_external:
+        raise typer.BadParameter("панель не должна быть открыта наружу; см. --allow-external")
+    settings = _load_settings()
+    configure_logging(settings, service="api")
+    if settings.api_token is None:
+        typer.secho("Не задан API_TOKEN — API не запускается", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        typer.secho(f"ВНИМАНИЕ: API слушает {host}", fg=typer.colors.RED, bold=True)
+    uvicorn.run(create_api(lambda: build_context(settings)), host=host, port=port, log_level="info")
+
+
 @app.command("notify-test")
 def notify_test() -> None:
     """Отправить тестовое уведомление оператору (Telegram или лог)."""

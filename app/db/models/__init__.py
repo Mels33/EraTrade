@@ -3,6 +3,7 @@
 Таблицы добавляются по этапам, см. §6.6 плана.
 """
 
+from app.db.models.api import ApiRequestRecord
 from app.db.models.control import (
     AuditLogRecord,
     BotStateRecord,
@@ -27,6 +28,7 @@ from app.db.models.trading import (
 
 __all__ = [
     "AccountSnapshotRecord",
+    "ApiRequestRecord",
     "AuditLogRecord",
     "BotStateRecord",
     "CandleRecord",
