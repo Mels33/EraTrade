@@ -351,7 +351,7 @@ async def shadow_report_endpoint(
 
     now = ctx.clock()
     async with ctx.sm() as db:
-        return await shadow_report(
+        report = await shadow_report(
             db,
             ctx.market_id,
             since=now - timedelta(days=days),
@@ -359,6 +359,37 @@ async def shadow_report_endpoint(
             step=INTERVALS[ctx.strategy.market.interval],
             cost_bps=float(ctx.strategy.target.cost_bps),
         )
+    # порог результатов для активации (полоса прогресса в панели)
+    report["live_min_outcomes"] = ctx.strategy.live.min_shadow_outcomes
+    report["min_probability"] = float(ctx.strategy.signal.min_probability)
+    return report
+
+
+@read.get("/candles")
+async def candles(
+    ctx: Ctx, hours: Annotated[int, Query(ge=2, le=24 * 14)] = 48
+) -> list[dict[str, Any]]:
+    """Закрытые свечи за последние hours часов (для графика цены)."""
+    from datetime import timedelta
+
+    async with ctx.sm() as db:
+        records = await market_repo.get_candles(
+            db,
+            ctx.market_id,
+            ctx.strategy.market.interval,
+            start=ctx.clock() - timedelta(hours=hours),
+        )
+    return [
+        {
+            "open_time": _t(c.open_time),
+            "open": _s(c.open),
+            "high": _s(c.high),
+            "low": _s(c.low),
+            "close": _s(c.close),
+            "volume": _s(c.volume),
+        }
+        for c in records
+    ]
 
 
 @read.get("/live/readiness")

@@ -1,9 +1,11 @@
 """Коллектор целиком: фейковая биржа (REST) + фейковый WebSocket + настоящий PostgreSQL."""
 
 import asyncio
+import dataclasses
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config.settings import Network
 from app.db.models import (
+    BookStatsRecord,
     CandleRecord,
     FundingHistoryRecord,
     HeartbeatRecord,
     MarketContextSnapshotRecord,
+    TradeFlowRecord,
 )
-from app.integrations.hyperliquid.gateway import HyperliquidGateway
+from app.integrations.hyperliquid.gateway import INTERVALS, HyperliquidGateway
 from app.integrations.hyperliquid.info_client import InfoClient
 from app.integrations.hyperliquid.parsing import datetime_to_ms
 from app.market_data.collector import CollectorConfig, MarketDataCollector, WsState
@@ -38,13 +42,14 @@ class Clock:
         return self.now
 
 
-def raw_candle(open_time: datetime, close: str = "101") -> dict[str, Any]:
+def raw_candle(open_time: datetime, close: str = "101", interval: str = "1h") -> dict[str, Any]:
     t = datetime_to_ms(open_time)
+    step_ms = int(INTERVALS[interval].total_seconds() * 1000)
     return {
         "t": t,
-        "T": t + 3_599_999,
+        "T": t + step_ms - 1,
         "s": "BTC",
-        "i": "1h",
+        "i": interval,
         "o": "100",
         "c": close,
         "h": "102",
@@ -63,11 +68,12 @@ class FakeExchange:
         self.meta = json.loads((FIXTURES / "meta_testnet.json").read_text())
         self.requests: list[str] = []
 
-    def candles(self) -> list[dict[str, Any]]:
+    def candles(self, interval: str = "1h") -> list[dict[str, Any]]:
+        step = INTERVALS[interval]
         result, t = [], self.history_start
         while t <= self.clock.now:
-            result.append(raw_candle(t))
-            t += H
+            result.append(raw_candle(t, interval=interval))
+            t += step
         return result
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -80,7 +86,11 @@ class FakeExchange:
             return httpx.Response(200, json=[self.meta, ctxs])
         if payload["type"] == "candleSnapshot":
             req = payload["req"]
-            page = [c for c in self.candles() if req["startTime"] <= c["t"] <= req["endTime"]]
+            page = [
+                c
+                for c in self.candles(req["interval"])
+                if req["startTime"] <= c["t"] <= req["endTime"]
+            ]
             return httpx.Response(200, json=page)
         if payload["type"] == "fundingHistory":
             page = [f for f in self.funding() if f["time"] >= payload["startTime"]]
@@ -359,3 +369,125 @@ async def _candle_close_is(
         stmt = select(CandleRecord).where(CandleRecord.open_time == open_time)
         record = (await s.execute(stmt)).scalar_one_or_none()
     return record is not None and str(record.close) == close and record.source == "ws"
+
+
+# --- этап 30m: свечи 30m, поток сделок и стакан ---
+
+
+def ws_trade(
+    t: datetime, tid: int, side: str = "B", px: str = "65000", sz: str = "0.5"
+) -> dict[str, Any]:
+    return {
+        "coin": "BTC",
+        "side": side,
+        "px": px,
+        "sz": sz,
+        "time": datetime_to_ms(t),
+        "tid": tid,
+        "hash": "0x0",
+        "users": [],
+    }
+
+
+def ws_book(t: datetime, bid_sz: str = "3", ask_sz: str = "1") -> dict[str, Any]:
+    def side(start: int, step: int, sz: str) -> list[dict[str, Any]]:
+        return [{"px": str(start + step * i), "sz": sz, "n": 1} for i in range(20)]
+
+    return {
+        "coin": "BTC",
+        "time": datetime_to_ms(t),
+        "levels": [side(64999, -1, bid_sz), side(65001, 1, ask_sz)],
+    }
+
+
+FLOW = dataclasses.replace(
+    FAST, extra_intervals=("30m",), flow_interval="30m", book_sample_seconds=10
+)
+
+
+async def test_extra_30m_candles_synced(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    sm = committing_sessionmaker
+    clock = Clock(T0 + 10 * H + timedelta(minutes=40))
+    collector = make_collector(sm, FakeExchange(clock, history_start=T0), config=FLOW)
+    await collector.refresh_meta()
+    await collector.sync_extra_candles()
+    closed_30m = await count(
+        sm, CandleRecord, CandleRecord.interval == "30m", CandleRecord.is_closed.is_(True)
+    )
+    assert closed_30m == 21  # 10.5 ч закрытых 30-минутных свечей от T0
+    clock.now += timedelta(minutes=30)
+    await collector.sync_extra_candles()
+    assert (
+        await count(
+            sm, CandleRecord, CandleRecord.interval == "30m", CandleRecord.is_closed.is_(True)
+        )
+        == 22
+    )
+
+
+async def test_flow_and_book_buckets_written(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    sm = committing_sessionmaker
+    start = T0 + 10 * H + timedelta(minutes=29)  # сбор начат за минуту до корзины 10:30
+    clock = Clock(start)
+    collector = make_collector(sm, FakeExchange(clock, history_start=T0), config=FLOW)
+    await collector.refresh_meta()
+    b0 = T0 + 10 * H  # корзина 10:00–10:30 — неполная (сбор начат посередине)
+    b1 = b0 + timedelta(minutes=30)
+    await collector._handle(
+        "trades", [ws_trade(start - timedelta(minutes=5), 1)]
+    )  # до старта — нет
+    await collector._handle("trades", [ws_trade(start + timedelta(seconds=1), 2)])
+    await collector._handle(
+        "trades",
+        [
+            ws_trade(b1 + timedelta(minutes=1), 3, "B", sz="1"),
+            ws_trade(b1 + timedelta(minutes=2), 4, "A", sz="0.25"),
+            ws_trade(b1 + timedelta(minutes=1), 3, "B", sz="1"),
+        ],
+    )  # дубль tid
+    await collector._handle("l2Book", ws_book(b1 + timedelta(minutes=1)))
+    await collector._handle(
+        "l2Book", ws_book(b1 + timedelta(minutes=1, seconds=3))
+    )  # чаще 10 с — пропуск
+    await collector._handle("l2Book", ws_book(b1 + timedelta(minutes=2), bid_sz="1", ask_sz="1"))
+
+    clock.now = b1 + timedelta(minutes=10)
+    assert await collector.flush_flow() == 1  # закрыта только корзина 10:00 (поток)
+    clock.now = b1 + timedelta(minutes=31)
+    await collector.flush_flow()
+
+    async with sm() as session:
+        flows = {r.open_time: r for r in (await session.execute(select(TradeFlowRecord))).scalars()}
+        books = {r.open_time: r for r in (await session.execute(select(BookStatsRecord))).scalars()}
+    assert not flows[b0].complete and flows[b0].buy_count == 1
+    full = flows[b1]
+    assert full.complete and full.buy_count == 1 and full.sell_count == 1
+    assert full.buy_volume == Decimal("1") and full.sell_volume == Decimal("0.25")
+    assert full.buy_notional == Decimal("65000")
+    book = books[b1]
+    assert book.complete and book.samples == 2
+    assert book.imbalance_top5_mean == pytest.approx((0.5 + 0.0) / 2)  # (3-1)/(3+1)=0.5 и 0
+    assert collector.health.last_flow_bucket == b1 and collector.health.last_flow_complete
+
+
+async def test_ws_gap_marks_buckets_incomplete(
+    committing_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    sm = committing_sessionmaker
+    clock = Clock(T0 + 10 * H - timedelta(minutes=1))
+    collector = make_collector(sm, FakeExchange(clock, history_start=T0), config=FLOW)
+    await collector.refresh_meta()
+    b = T0 + 10 * H
+    await collector._handle("trades", [ws_trade(b + timedelta(minutes=1), 1)])
+    assert collector._flow is not None
+    collector._flow.mark_gap(b + timedelta(minutes=5), b + timedelta(minutes=6))  # обрыв WS
+    await collector._handle("trades", [ws_trade(b + timedelta(minutes=7), 2)])
+    clock.now = b + timedelta(minutes=31)
+    await collector.flush_flow()
+    async with sm() as session:
+        row = (await session.execute(select(TradeFlowRecord))).scalar_one()
+    assert not row.complete and row.buy_count == 2

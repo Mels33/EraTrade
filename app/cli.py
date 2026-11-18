@@ -299,6 +299,10 @@ def collect() -> None:
         coin=strategy.market.coin,
         interval=strategy.market.interval,
         max_ws_silence=float(strategy.freshness.max_ws_silence_seconds),
+        # Сбор 30m-свечей и сумм потока/стакана Hyperliquid выключен (решение 2026-11-18:
+        # без накопления; модель «спрос и предложение» — по публичным данным Binance).
+        extra_intervals=(),
+        flow_interval=None,
     )
 
     async def _run() -> None:
@@ -1039,6 +1043,11 @@ def dataset_cmd(
     fractions: str = typer.Option(
         "0.6,0.15,0.1,0.15", help="Доли train,validation,calibration,test"
     ),
+    binance: bool = typer.Option(
+        True,
+        "--binance/--no-binance",
+        help="Добавить в train историю Binance до начала данных Hyperliquid",
+    ),
 ) -> None:
     """Построить обучающий набор: признаки + target, хронологическое разбиение, манифест."""
     from pathlib import Path
@@ -1068,6 +1077,15 @@ def dataset_cmd(
             session, market_id, interval, start=_parse_time(start), end=_parse_time(end)
         )
 
+    async def _load_binance(session: AsyncSession) -> tuple[list, list] | None:  # type: ignore[type-arg]
+        from app.config.settings import Network
+        from app.integrations.binance import DEX
+
+        record = await market_repo.get_market(session, Network.MAINNET, coin, dex=DEX)
+        if record is None:
+            return None
+        return await load_history(session, record.id, interval, end=_parse_time(end))
+
     candles, funding = _run_in_transaction(settings, _load)
     target = TargetParams(
         horizon_candles=strategy.market.horizon_candles,
@@ -1079,6 +1097,20 @@ def dataset_cmd(
         typer.secho("Набор пуст — мало данных", fg=typer.colors.RED)
         raise typer.Exit(code=1)
     parts = chronological_split(dataset.rows, step * target.horizon_candles, parts_fractions)
+    if binance:
+        from app.features.dataset import with_auxiliary
+
+        aux_history = _run_in_transaction(settings, _load_binance)
+        if aux_history is None:
+            typer.secho(
+                "Истории Binance нет — набор только из Hyperliquid (eratrade import-binance)",
+                fg=typer.colors.YELLOW,
+            )
+        else:
+            aux = build_dataset(*aux_history, target, step=step, source="binance")
+            dataset, parts = with_auxiliary(
+                dataset, parts, aux, horizon=step * target.horizon_candles, name="binance"
+            )
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     name = f"{settings.network.value}-{coin}-{interval}-{FEATURE_SET_VERSION}-{stamp}"
     out_dir = Path(out) / name
@@ -1100,6 +1132,20 @@ def dataset_cmd(
         f"Target: горизонт {target.horizon_candles} св., порог ±{target.threshold_bps} bp "
         f"(издержки {target.cost_bps} bp)"
     )
+    aux_info = manifest.get("auxiliary")
+    if aux_info:
+        ov = aux_info["overlap"]
+        typer.echo(
+            f"Binance в train: {aux_info['rows_in_train']} строк "
+            f"({(aux_info['start'] or '')[:10]} … {(aux_info['end'] or '')[:10]})"
+        )
+        if ov.get("overlap_rows"):
+            weak = ", ".join(ov["weak_features"]) or "нет"
+            typer.echo(
+                f"Сверка с Hyperliquid на {ov['overlap_rows']} общих часах: метки совпадают "
+                f"{ov['label_agreement']:.1%}, корреляция доходности {ov['fwd_return_corr']:.3f}; "
+                f"расходящиеся признаки: {weak}"
+            )
     typer.echo(
         f"{'участок':<12}{'строк':>6}  {'период':<35}{'DOWN':>7}{'FLAT':>7}{'UP':>7}"
         f"{'baseline logloss':>18}{'brier':>8}"
@@ -1815,6 +1861,473 @@ def trades_cmd(limit: int = typer.Option(20, help="Сколько последн
                 typer.secho("  ✓ размер и стоп в порядке", fg=typer.colors.GREEN)
 
     _run_in_transaction(settings, _list)
+
+
+# --- вспомогательная история Binance (§7.4) ---
+
+
+@app.command("import-binance")
+def import_binance_cmd(
+    since: str = typer.Option("2022-01-01", help="С какой даты загрузить (UTC)"),
+    interval: str = typer.Option("1h", help="1h (свечи + funding + premium) или 30m (свечи)"),
+) -> None:
+    """Загрузить историю BTCUSDT perp с Binance (свечи 1h, funding, premium) — только для
+    обучения. Идемпотентно: повторный запуск догружает новое."""
+    from app.integrations.binance import (
+        DEX,
+        BinanceFuturesClient,
+        binance_market_meta,
+        hourly_funding,
+        utc,
+    )
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin = strategy.market.coin
+    start, now = utc(since), datetime.now(UTC)
+
+    async def _run() -> None:
+        if interval not in ("1h", "30m"):
+            raise typer.BadParameter("interval: 1h или 30m")
+        async with BinanceFuturesClient() as client:
+            typer.echo(f"Свечи {interval}…")
+            candles = await client.candles(start, now, now=now, interval=interval)
+            funding = []
+            if interval == "1h":
+                typer.echo("Funding и premium…")
+                rates = await client.funding_rates(start - timedelta(hours=16), now)
+                premium = await client.premium(start, now)
+                funding = hourly_funding(rates, premium)
+        engine = create_engine(settings)
+        try:
+            async with create_sessionmaker(engine).begin() as session:
+                market_id = await upsert_market(session, binance_market_meta(coin, now))
+                written = await market_repo.upsert_candles(session, market_id, candles)
+                funding_written = await market_repo.upsert_funding_history(
+                    session, market_id, funding
+                )
+        finally:
+            await engine.dispose()
+        first = candles[0].open_time if candles else None
+        last = candles[-1].open_time if candles else None
+        typer.secho(f"Binance ({DEX}) {coin} {interval}", bold=True)
+        typer.echo(
+            f"Свечей {len(candles)} ({first:%Y-%m-%d} … {last:%Y-%m-%d %H:%M} UTC), "
+            f"записано {written}; точек funding {len(funding)}, записано {funding_written}"
+            if first and last
+            else "Свечей не получено"
+        )
+
+    asyncio.run(_run())
+
+
+# --- эксперимент с целевой переменной ---
+
+
+@app.command("target-experiment")
+def target_experiment_cmd(
+    variants: str = typer.Option("fixed4,vol4,vol8,barrier8", help="Варианты через запятую"),
+    trades_per_day: float = typer.Option(1.0, help="Желаемая частота сделок (подбор порога)"),
+    binance: bool = typer.Option(True, "--binance/--no-binance", help="История Binance в train"),
+    out: str = typer.Option("data/experiments", help="Каталог отчётов"),
+) -> None:
+    """Сравнить варианты метки на одних данных: сигналы в день, угадано, результат после
+    издержек (validation — выбор порога, test — подтверждение). Ничего в mainnet не меняет."""
+    from pathlib import Path
+
+    from app.config.settings import Network
+    from app.features.loader import load_history
+    from app.integrations.binance import DEX
+    from app.models.experiment import DEFAULT_VARIANTS, run_experiment
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin, interval = strategy.market.coin, strategy.market.interval
+    names = [v.strip() for v in variants.split(",") if v.strip()]
+    unknown = [n for n in names if n not in DEFAULT_VARIANTS]
+    if unknown:
+        raise typer.BadParameter(f"неизвестные варианты: {unknown}; есть {list(DEFAULT_VARIANTS)}")
+
+    async def _load(session: AsyncSession) -> tuple[Any, Any]:
+        primary = await load_history(session, await _market_id(session, settings, coin), interval)
+        aux = None
+        if binance:
+            record = await market_repo.get_market(session, Network.MAINNET, coin, dex=DEX)
+            if record is not None:
+                aux = await load_history(session, record.id, interval)
+        return primary, aux
+
+    primary, aux = _run_in_transaction(settings, _load)
+    typer.echo("Считаю признаки и обучаю варианты (несколько минут)…")
+    report = run_experiment(
+        primary,
+        aux,
+        [DEFAULT_VARIANTS[n] for n in names],
+        cost_bps=strategy.target.cost_bps,
+        edge_bps=strategy.target.cost_bps + strategy.target.safety_margin_bps,
+        trades_per_day=trades_per_day,
+    )
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = Path(out) / stamp
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+
+    typer.secho(
+        f"Строк: {report['rows']} · источники {report['rows_by_source']} · "
+        f"цель {trades_per_day:g} сделки/день, издержки {report['cost_bps']} bp",
+        bold=True,
+    )
+    if report["auxiliary"]:
+        typer.echo(f"Игнорируемые признаки: {', '.join(report['auxiliary']['ignored_features'])}")
+
+    def fmt(v: float | None, spec: str) -> str:
+        return "—" if v is None else format(v, spec)
+
+    header = (
+        f"{'вариант':<10}{'logloss↓':>9}{'θ':>6}  "
+        f"{'VALIDATION: сделок/день угадано ср.нетто сумма':<48}"
+        f"{'TEST: сделок/день угадано ср.нетто сумма'}"
+    )
+    typer.echo(header)
+    for v in report["variants"]:
+        val, test = v["segments"]["validation"], v["segments"]["test"]
+
+        def cell(seg: dict[str, Any]) -> str:
+            t = seg.get("trading")
+            if not t:
+                return f"{'нет сигналов':<46}"
+            return (
+                f"{t['trades']:>4} {t['per_day']:>5.2f}/д {fmt(t['hit_rate'], '>5.0%')}"
+                f" {fmt(t['mean_net'], '>+8.3%')} {t['sum_net']:>+8.2%}"
+            ).ljust(46)
+
+        typer.echo(
+            f"{v['variant']:<10}{fmt(val['log_loss_gain'], '>8.1%')} "
+            f"{fmt(v['theta'], '>5.2f')}  {cell(val)}  {cell(test)}"
+        )
+    typer.echo("logloss↓ — улучшение относительно угадывания по частотам на validation.")
+    typer.echo(report["note"])
+    typer.echo(f"Отчёт: {out_dir / 'report.json'}")
+
+
+@app.command("walk-forward")
+def walk_forward_cmd(
+    variants: str = typer.Option("fixed4,vol4,vol8,barrier8", help="Варианты через запятую"),
+    trades_per_day: float = typer.Option(1.0, help="Желаемая частота сделок (подбор порога)"),
+    test_months: int = typer.Option(3, help="Длина проверочного окна, месяцев"),
+    out: str = typer.Option("data/experiments", help="Каталог отчётов"),
+) -> None:
+    """Скользящая проверка вариантов метки на годах истории (Binance + Hyperliquid): модель
+    каждого окна учится только на прошлом. Ничего в mainnet не меняет."""
+    from pathlib import Path
+
+    from app.config.settings import Network
+    from app.features.loader import load_history
+    from app.integrations.binance import DEX
+    from app.models.experiment import DEFAULT_VARIANTS
+    from app.models.walkforward import walk_forward
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin, interval = strategy.market.coin, strategy.market.interval
+    names = [v.strip() for v in variants.split(",") if v.strip()]
+    unknown = [n for n in names if n not in DEFAULT_VARIANTS]
+    if unknown:
+        raise typer.BadParameter(f"неизвестные варианты: {unknown}; есть {list(DEFAULT_VARIANTS)}")
+
+    async def _load(session: AsyncSession) -> tuple[Any, Any]:
+        primary = await load_history(session, await _market_id(session, settings, coin), interval)
+        record = await market_repo.get_market(session, Network.MAINNET, coin, dex=DEX)
+        aux = await load_history(session, record.id, interval) if record else None
+        return primary, aux
+
+    primary, aux = _run_in_transaction(settings, _load)
+    if aux is None:
+        typer.secho(
+            "Нет истории Binance (eratrade import-binance) — проверка будет короткой",
+            fg=typer.colors.YELLOW,
+        )
+    report = walk_forward(
+        primary,
+        aux,
+        [DEFAULT_VARIANTS[n] for n in names],
+        cost_bps=strategy.target.cost_bps,
+        edge_bps=strategy.target.cost_bps + strategy.target.safety_margin_bps,
+        trades_per_day=trades_per_day,
+        test_months=test_months,
+        progress=lambda msg: typer.echo(f"  {msg}"),
+    )
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = Path(out) / f"walk-forward-{stamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+
+    def pct(v: float | None, spec: str = "+.3%") -> str:
+        return "—" if v is None else format(v, spec)
+
+    typer.secho(
+        f"Окон: {report['folds']} ({(report['first_test'] or '')[:10]} … "
+        f"{(report['last_test_end'] or '')[:10]}), строк {report['rows_by_source']}, "
+        f"цель {trades_per_day:g} сделки/день, издержки {report['cost_bps']} bp",
+        bold=True,
+    )
+    typer.echo(
+        f"{'вариант':<10}{'сделок':>7}{'в день':>8}{'угадано':>9}{'ср.нетто':>10}"
+        f"{'t-стат':>8}{'сумма':>10}{'приб.окон':>11}{'случайный вход':>17}"
+    )
+    for v in report["variants"]:
+        t = v["total"]
+        rnd = v["random_entry"]
+        typer.echo(
+            f"{v['variant']:<10}{t['trades']:>7}{t['per_day']:>8.2f}{pct(t['hit_rate'], '.0%'):>9}"
+            f"{pct(t['mean_net']):>10}{pct(t['t_stat'], '+.2f'):>8}{t['sum_net']:>+10.1%}"
+            f"{v['profitable_folds']:>5}/{len(v['folds']):<5}"
+            f"{pct(rnd['long_mean_net']):>9} long"
+        )
+    typer.echo("По годам (сделок / ср.нетто / сумма):")
+    for v in report["variants"]:
+        years = "  ".join(
+            f"{y}: {s['trades']} / {pct(s['mean_net'])} / {s['sum_net']:+.1%}"
+            for y, s in v["by_year"].items()
+        )
+        typer.echo(f"  {v['variant']:<10}{years}")
+    typer.echo("t-стат: |t| > 2 — результат вряд ли случайность; |t| < 1 — неотличим от нуля.")
+    typer.echo(report["note"])
+    typer.echo(f"Отчёт: {out_dir / 'report.json'}")
+
+
+@app.command("walk-forward-30m")
+def walk_forward_30m_cmd(
+    variants: str = typer.Option("vol4,vol8,barrier8,barrier16", help="Варианты через запятую"),
+    trades_per_day: float = typer.Option(1.0, help="Желаемая частота сделок (подбор порога)"),
+    test_months: int = typer.Option(3, help="Длина проверочного окна, месяцев"),
+    out: str = typer.Option("data/experiments", help="Каталог отчётов"),
+) -> None:
+    """Скользящая проверка 30m: признаки v2 с потоком сделок (Binance 30m с 2020),
+    исполнение taker и maker, разбивка long/short. Ничего в mainnet не меняет."""
+    from pathlib import Path
+
+    from app.config.settings import Network
+    from app.integrations.binance import DEX
+    from app.models.walkforward_30m import VARIANTS_30M, walk_forward_30m
+
+    settings = _load_settings()
+    strategy = load_strategy(settings.strategy_config_path)
+    coin = strategy.market.coin
+    names = [v.strip() for v in variants.split(",") if v.strip()]
+    unknown = [n for n in names if n not in VARIANTS_30M]
+    if unknown:
+        raise typer.BadParameter(f"неизвестные варианты: {unknown}; есть {list(VARIANTS_30M)}")
+
+    async def _load(session: AsyncSession) -> list[Any]:
+        from app.features.loader import candle_from_record
+
+        record = await market_repo.get_market(session, Network.MAINNET, coin, dex=DEX)
+        if record is None:
+            raise typer.BadParameter("нет истории Binance: eratrade import-binance --interval 30m")
+        return [
+            candle_from_record(r) for r in await market_repo.get_candles(session, record.id, "30m")
+        ]
+
+    candles = _run_in_transaction(settings, _load)
+    report = walk_forward_30m(
+        candles,
+        [VARIANTS_30M[n] for n in names],
+        trades_per_day=trades_per_day,
+        test_months=test_months,
+        progress=lambda msg: typer.echo(f"  {msg}"),
+    )
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = Path(out) / f"walk-forward-30m-{stamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+
+    def pct(v: float | None, spec: str = "+.3%") -> str:
+        return "—" if v is None else format(v, spec)
+
+    typer.secho(
+        f"30m · окон {report['folds']} с {(report['first_test'] or '')[:10]} · "
+        f"строк {report['rows']} · цель {trades_per_day:g} сделки/день",
+        bold=True,
+    )
+    typer.echo(
+        f"{'вариант':<10}{'исп.':<6}{'сделок':>7}{'в день':>7}{'угадано':>8}{'ср.нетто':>10}"
+        f"{'t':>7}{'сумма':>9}{'приб.окон':>10}{'исполн.':>8}"
+        f"  {'long ср./t':>15}  {'short ср./t':>15}  {'случ. long/short':>18}"
+    )
+    for v in report["variants"]:
+        for cm, m in v["models"].items():
+            t, lg, sh, rnd = m["total"], m["long"], m["short"], m["random_entry"]
+            typer.echo(
+                f"{v['variant']:<10}{cm:<6}{t['trades']:>7}{t['per_day']:>7.2f}"
+                f"{pct(t['hit_rate'], '.0%'):>8}"
+                f"{pct(t['mean_net']):>10}{pct(t['t_stat'], '+.2f'):>7}{t['sum_net']:>+9.0%}"
+                f"{m['profitable_folds']:>5}/{len(m['folds']):<4}{pct(m['fill_rate'], '.0%'):>8}"
+                f"  {pct(lg['mean_net'])}/{pct(lg['t_stat'], '+.1f'):>5}"
+                f"  {pct(sh['mean_net'])}/{pct(sh['t_stat'], '+.1f'):>5}"
+                f"  {pct(rnd['long'], '+.2%')}/{pct(rnd['short'], '+.2%')}"
+            )
+    typer.echo("t: |t| > 2 — вряд ли случайность. «исполн.» — доля исполненных maker-заявок.")
+    typer.echo(report["note"])
+    typer.echo(f"Отчёт: {out_dir / 'report.json'}")
+
+
+# --- модель «спрос и предложение»: публичные данные Binance ---
+
+
+@app.command("micro-data")
+def micro_data_cmd(
+    since: str = typer.Option("2023-01-01", help="С какого дня (UTC)"),
+    until: str | None = typer.Option(None, help="По какой день включительно (по умолчанию вчера)"),
+    out: str = typer.Option("data/micro/bars", help="Каталог минутных файлов"),
+    raw: str = typer.Option("data/binance_public/raw", help="Каталог сырых архивов"),
+    keep_raw: bool = typer.Option(False, help="Не удалять сырые zip после агрегации"),
+    workers: int = typer.Option(4, help="Сколько дней обрабатывать параллельно"),
+) -> None:
+    """Скачать дневные архивы Binance (aggTrades, bookDepth) с проверкой sha256 и собрать
+    минутные строки «спрос и предложение». Идемпотентно: готовые дни пропускаются."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import date, timedelta
+    from pathlib import Path
+
+    import httpx
+
+    from app.integrations.binance_public import download
+    from app.research.micro_bars import bars_path, build_day
+
+    first = date.fromisoformat(since)
+    last = date.fromisoformat(until) if until else datetime.now(UTC).date() - timedelta(days=1)
+    out_dir, raw_dir = Path(out), Path(raw)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    days = [first + timedelta(days=i) for i in range((last - first).days + 1)]
+    # свежие дни первыми: данные с ближним стаканом (2026) готовы раньше всего
+    todo = [d for d in reversed(days) if not bars_path(out_dir, d.isoformat()).exists()]
+    typer.echo(f"Дней: {len(days)}, готово: {len(days) - len(todo)}, к обработке: {len(todo)}")
+
+    def job(day: date, client: httpx.Client) -> tuple[str, str]:
+        trades = download(client, "aggTrades", day, raw_dir)
+        if trades is None:
+            return day.isoformat(), "нет сделок в архиве"
+        depth = download(client, "bookDepth", day, raw_dir)
+        bars = build_day(trades, depth, day.isoformat())
+        target = bars_path(out_dir, day.isoformat())
+        tmp = target.with_name(target.name + ".part")
+        bars.to_csv(tmp, index=False, compression="gzip")
+        tmp.replace(target)
+        if not keep_raw:
+            for f in (trades, depth):
+                if f is not None:
+                    f.unlink(missing_ok=True)
+        trades_ok, depth_ok = int(bars["trades_ok"].sum()), int(bars["depth_ok"].sum())
+        return day.isoformat(), f"сделки {trades_ok}/1440, ближний стакан {depth_ok}/1440"
+
+    problems = []
+    with (
+        httpx.Client(timeout=120, follow_redirects=True) as client,
+        ThreadPoolExecutor(workers) as pool,
+    ):
+        futures = {pool.submit(job, d, client): d for d in todo}
+        for n, future in enumerate(as_completed(futures), 1):
+            try:
+                day, status = future.result()
+            except Exception as exc:
+                day, status = futures[future].isoformat(), f"ошибка: {exc}"
+            if not status.startswith("сделки 1440/") or n % 50 == 0:
+                typer.echo(f"  [{n}/{len(todo)}] {day}: {status}")
+            if not status.startswith("сделки 1440/"):
+                problems.append((day, status))
+    typer.secho(f"Готово. Дней с неполными сделками или ошибками: {len(problems)}", bold=True)
+
+
+@app.command("walk-forward-micro")
+def walk_forward_micro_cmd(
+    model: str = typer.Option(
+        "flow", help="flow — поток сделок (с 2023); book — + стакан ±0.2% (с 2026)"
+    ),
+    variants: str = typer.Option("ret1,ret5,ret15,barrier5,barrier15", help="Варианты метки"),
+    targets: str = typer.Option("1,5,20", help="Целевые частоты сделок в день"),
+    deep: bool = typer.Option(False, help="Добавить глубокие уровни ±1…5% (только исследование)"),
+    bars_dir: str = typer.Option("data/micro/bars", help="Каталог минутных файлов"),
+    out: str = typer.Option("data/experiments", help="Каталог отчётов"),
+) -> None:
+    """Скользящая проверка модели «спрос и предложение» (решение каждую минуту, горизонты
+    1/5/15 мин, исполнение taker и maker). Ничего в mainnet не меняет."""
+    from pathlib import Path
+
+    from app.research.micro_bars import load_bars
+    from app.research.walkforward_micro import VARIANTS, walk_forward_micro
+
+    if model not in ("flow", "book"):
+        raise typer.BadParameter("model: flow или book")
+    names = [v.strip() for v in variants.split(",") if v.strip()]
+    unknown = [n for n in names if n not in VARIANTS]
+    if unknown:
+        raise typer.BadParameter(f"неизвестные варианты: {unknown}; есть {list(VARIANTS)}")
+    target_list = [float(t) for t in targets.split(",")]
+    typer.echo("Загружаю минутные данные…")
+    bars = load_bars(Path(bars_dir))
+    depth = model == "book"
+    report = walk_forward_micro(
+        bars,
+        [VARIANTS[n] for n in names],
+        depth=depth,
+        deep=deep,
+        trades_per_day=target_list,
+        test_months=1 if depth else 3,
+        min_train_months=4 if depth else 12,
+        max_train_months=None if depth else 12,
+        progress=lambda msg: typer.echo(f"  {msg}"),
+    )
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = Path(out) / f"walk-forward-micro-{model}{'-deep' if deep else ''}-{stamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+
+    def pct(v: float | None, spec: str = "+.3%") -> str:
+        return "—" if v is None else format(v, spec)
+
+    typer.secho(
+        f"Модель {model}{' + глубокий стакан' if deep else ''} · окон {report['folds']} "
+        f"с {(report['first_test'] or '')[:10]} · валидных минут {report['rows_valid']}",
+        bold=True,
+    )
+    typer.echo(
+        f"{'вариант':<10}{'исп.':<6}{'цель':>5}{'сделок':>8}{'в день':>8}{'угадано':>8}"
+        f"{'ср.нетто':>10}{'t':>7}{'сумма':>9}{'приб.окон':>10}{'исполн.':>8}"
+        f"{'long t':>8}{'short t':>8}"
+    )
+    for v in report["variants"]:
+        for r in v["results"]:
+            t = r["total"]
+            typer.echo(
+                f"{v['variant']:<10}{r['cost_model']:<6}{r['trades_per_day_target']:>5g}"
+                f"{t['trades']:>8}{t['per_day']:>8.2f}{pct(t['hit_rate'], '.0%'):>8}"
+                f"{pct(t['mean_net']):>10}{pct(t['t_stat'], '+.2f'):>7}{t['sum_net']:>+9.0%}"
+                f"{r['profitable_folds']:>5}/{len(r['folds']):<4}{pct(r['fill_rate'], '.0%'):>8}"
+                f"{pct(r['long']['t_stat'], '+.1f'):>8}{pct(r['short']['t_stat'], '+.1f'):>8}"
+            )
+        rnd = v["random_entry"]
+        typer.echo(
+            f"{'':<10}случайный вход: "
+            + "; ".join(
+                f"{cm} long {pct(sides['long'])} short {pct(sides['short'])}"
+                for cm, sides in rnd.items()
+            )
+        )
+    typer.echo(
+        "gross — без издержек: есть ли у признаков сила предсказания вообще. "
+        "t: |t| > 2 — вряд ли случайность. «исполн.» — доля исполненных maker-заявок."
+    )
+    typer.echo(report["note"])
+    typer.echo(f"Отчёт: {out_dir / 'report.json'}")
 
 
 if __name__ == "__main__":

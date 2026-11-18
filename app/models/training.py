@@ -10,6 +10,7 @@ import json
 import math
 import shutil
 import tempfile
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -63,6 +64,7 @@ class Sample:
     label: Label
     fwd_return: float
     features: tuple[float, ...]
+    source: str = "hyperliquid"
 
 
 def load_dataset_dir(path: Path) -> tuple[dict[str, Any], dict[str, list[Sample]]]:
@@ -83,7 +85,8 @@ def load_dataset_dir(path: Path) -> tuple[dict[str, Any], dict[str, list[Sample]
     with csv_path.open(newline="") as f:
         reader = csv.reader(f)
         header = next(reader)
-        if header[4:] != list(FEATURE_NAMES):
+        first = 5 if manifest.get("format", 1) >= 2 else 4  # формат 2: столбец source
+        if header[first:] != list(FEATURE_NAMES):
             raise TrainingError("заголовок dataset.csv не совпадает с признаками")
         for row in reader:
             parts.setdefault(row[1], []).append(
@@ -91,7 +94,8 @@ def load_dataset_dir(path: Path) -> tuple[dict[str, Any], dict[str, list[Sample]
                     decision_time=datetime.fromisoformat(row[0]),
                     label=Label(row[2]),
                     fwd_return=float(row[3]),
-                    features=tuple(float(x) for x in row[4:]),
+                    features=tuple(float(x) for x in row[first:]),
+                    source=row[4] if first == 5 else "hyperliquid",
                 )
             )
     for name in ("train", "validation", "calibration", "test"):
@@ -235,6 +239,11 @@ def train_model(
     manifest, parts = load_dataset_dir(dataset_dir)
     train, val, cal, test = (parts[n] for n in ("train", "validation", "calibration", "test"))
     cb_params = {**CATBOOST_PARAMS, **(catboost_params or {})}
+    # Признаки, которые у вспомогательного источника не совпадают с Hyperliquid (сверка на
+    # общем периоде), модель не использует: иначе она выучит чужую механику funding/premium.
+    ignored = sorted((manifest.get("auxiliary") or {}).get("overlap", {}).get("weak_features", []))
+    if ignored:
+        cb_params["ignored_features"] = [FEATURE_NAMES.index(name) for name in ignored]
     model = CatBoostClassifier(**cb_params, class_names=[c.value for c in CLASSES])
     model.fit(_matrix(train), _labels(train), eval_set=(_matrix(val), _labels(val)))
     if [str(c) for c in model.classes_] != [c.value for c in CLASSES]:
@@ -299,6 +308,7 @@ def train_model(
                 "start": rows[0].decision_time.isoformat(),
                 "end": rows[-1].decision_time.isoformat(),
                 "rows": len(rows),
+                "rows_by_source": dict(Counter(r.source for r in rows)),
             }
             for name, rows in (
                 ("train", train),
@@ -334,6 +344,8 @@ def train_model(
             "source_sha256": manifest["source"]["sha256"],
         },
         "dataset_dir": str(dataset_dir),
+        "auxiliary_source": manifest.get("auxiliary"),
+        "ignored_features": ignored,
         "code_version": manifest.get("code_version"),
     }
     return write_artifact(out_dir, meta)

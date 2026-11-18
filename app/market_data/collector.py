@@ -32,6 +32,7 @@ from app.integrations.hyperliquid.ws import (
     iter_messages,
     subscribe_message,
 )
+from app.market_data.flow import BookAggregator, FlowAggregator
 from app.market_data.metadata import sync_market
 
 COMPONENT = "collector"
@@ -72,6 +73,12 @@ class CollectorConfig:
     open_candle_write_interval: float = 10.0
     reconnect_initial_delay: float = 1.0
     reconnect_max_delay: float = 30.0
+    # Этап 30m: дополнительные интервалы свечей (REST сразу после границы) и сбор потока
+    # сделок / стакана по корзинам flow_interval. None — не собирать.
+    extra_intervals: tuple[str, ...] = ()
+    flow_interval: str | None = None
+    book_sample_seconds: float = 10.0
+    flow_flush_interval: float = 5.0
 
 
 @dataclass
@@ -81,6 +88,8 @@ class CollectorHealth:
     last_rest_sync_at: datetime | None = None
     last_closed_open_time: datetime | None = None
     last_funding_time: datetime | None = None
+    last_flow_bucket: datetime | None = None
+    last_flow_complete: bool | None = None
     reconnects: int = 0
     last_error: str | None = None
     last_ctx: AssetContext | None = field(default=None, repr=False)
@@ -99,6 +108,10 @@ class CollectorHealth:
             "last_funding_time": (
                 self.last_funding_time.isoformat() if self.last_funding_time else None
             ),
+            "last_flow_bucket": (
+                self.last_flow_bucket.isoformat() if self.last_flow_bucket else None
+            ),
+            "last_flow_complete": self.last_flow_complete,
             "reconnects": self.reconnects,
             "last_error": self.last_error,
         }
@@ -134,6 +147,18 @@ class MarketDataCollector:
         self._open_candle_time: datetime | None = None
         self._open_candle_written_at: datetime | None = None
         self._sync_lock = asyncio.Lock()
+        for extra in config.extra_intervals:
+            if extra not in INTERVALS:
+                raise ValueError(f"неподдерживаемый интервал {extra}")
+        self._flow: FlowAggregator | None = None
+        self._book: BookAggregator | None = None
+        if config.flow_interval is not None:
+            flow_step = INTERVALS[config.flow_interval]
+            self._flow = FlowAggregator(flow_step, started_at=self.started_at)
+            self._book = BookAggregator(
+                flow_step, started_at=self.started_at, sample_seconds=config.book_sample_seconds
+            )
+        self._gap_since: datetime | None = None
 
     # --- запуск ---
 
@@ -158,6 +183,10 @@ class MarketDataCollector:
             )
             tg.create_task(self._every(self.config.meta_refresh_interval, self.refresh_meta))
             tg.create_task(self._every(self.config.funding_sync_interval, self.sync_funding))
+            if self.config.extra_intervals:
+                tg.create_task(self._extra_candles_loop())
+            if self._flow is not None:
+                tg.create_task(self._every(self.config.flow_flush_interval, self.flush_flow))
 
     async def _every(
         self,
@@ -259,6 +288,59 @@ class MarketDataCollector:
             self.health.last_funding_time = last
         return written
 
+    async def sync_extra_candles(self) -> int:
+        """Свечи дополнительных интервалов (30m): догрузка с последней закрытой в БД."""
+        market_id = self._require_market()
+        written = 0
+        now = self._clock()
+        for interval in self.config.extra_intervals:
+            step = INTERVALS[interval]
+            async with self._sessionmaker() as session:
+                last = await market_repo.get_last_closed_candle(session, market_id, interval)
+            start = (
+                last.open_time + step
+                if last is not None
+                else floor_time(now, step) - step * self.config.backfill_candles
+            )
+            candles = await self._gateway.get_candles(self.config.coin, interval, start=start)
+            async with self._sessionmaker.begin() as session:
+                written += await market_repo.upsert_candles(session, market_id, candles)
+        return written
+
+    async def _extra_candles_loop(self) -> None:
+        """Сразу после каждой границы самого короткого доп. интервала (+ close_grace) и
+        не реже rest_sync_interval."""
+        step = min(INTERVALS[i] for i in self.config.extra_intervals)
+        await self._guarded(self.sync_extra_candles)
+        while True:
+            now = self._clock()
+            until_boundary = (floor_time(now, step) + step - now).total_seconds()
+            await self._sleep(
+                min(until_boundary + self.config.close_grace, self.config.rest_sync_interval)
+            )
+            await self._guarded(self.sync_extra_candles)
+
+    async def flush_flow(self) -> int:
+        """Записывает закрытые корзины потока сделок и стакана."""
+        if self._flow is None or self._book is None or self.config.flow_interval is None:
+            return 0
+        now = self._clock()
+        flow, book = self._flow.pop_closed(now), self._book.pop_closed(now)
+        if not flow and not book:
+            return 0
+        market_id = self._require_market()
+        async with self._sessionmaker.begin() as session:
+            written = await market_repo.upsert_trade_flow(
+                session, market_id, self.config.flow_interval, flow
+            )
+            written += await market_repo.upsert_book_stats(
+                session, market_id, self.config.flow_interval, book
+            )
+        if flow:
+            self.health.last_flow_bucket = flow[-1].open_time
+            self.health.last_flow_complete = flow[-1].complete
+        return written
+
     # --- контекст рынка ---
 
     async def sample_context(self) -> None:
@@ -314,6 +396,8 @@ class MarketDataCollector:
                 )
             else:
                 logfire.warn("collector: WebSocket закрыт, переподключение")
+            if self._gap_since is None:
+                self._gap_since = self.health.last_ws_message_at or self._clock()
             self.health.ws_state = WsState.RECONNECTING
             self.health.reconnects += 1
             await self._sleep(delay)
@@ -325,10 +409,16 @@ class MarketDataCollector:
                 delay = min(delay * 2, self.config.reconnect_max_delay)
 
     def _subscriptions(self) -> list[dict[str, str]]:
-        return [
+        subs = [
             {"type": "candle", "coin": self.config.coin, "interval": self.config.interval},
             {"type": "activeAssetCtx", "coin": self.config.coin},
         ]
+        if self._flow is not None:
+            subs += [
+                {"type": "trades", "coin": self.config.coin},
+                {"type": "l2Book", "coin": self.config.coin},
+            ]
+        return subs
 
     async def _run_connection(self, conn: WsConnection) -> None:
         subscriptions = self._subscriptions()
@@ -353,6 +443,13 @@ class MarketDataCollector:
         await asyncio.wait_for(wait_for_acks(), timeout=self.config.subscribe_timeout)
 
         # Подписки активны: всё, что придёт дальше, не потеряется. Закрываем разрыв через REST.
+        if self._gap_since is not None:
+            # поток и стакан за время обрыва не восстановить — корзины неполные
+            now = self._clock()
+            for agg in (self._flow, self._book):
+                if agg is not None:
+                    agg.mark_gap(self._gap_since, now)
+            self._gap_since = None
         self.health.ws_state = WsState.SYNCING
         await self.sync_candles()
         self.health.ws_state = WsState.HEALTHY
@@ -386,6 +483,12 @@ class MarketDataCollector:
             self.health.last_ctx = parsing.parse_ws_asset_context(
                 data, coin=self.config.coin, received_at=now
             )
+        elif channel == "trades" and self._flow is not None:
+            self._flow.add(parsing.parse_ws_trades(data, coin=self.config.coin))
+        elif channel == "l2Book" and self._book is not None:
+            snapshot = parsing.parse_ws_l2book(data, coin=self.config.coin)
+            if snapshot is not None:
+                self._book.add(snapshot)
         elif channel == "subscriptionResponse":
             pass
         else:

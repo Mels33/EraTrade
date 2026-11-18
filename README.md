@@ -142,6 +142,20 @@ uv run eratrade dataset                  # набор в data/datasets/<сеть
 target, распределение классов, baseline log loss / Brier, sha256 исходных данных и набора).
 Funding копит коллектор; история загружается `eratrade backfill --hours 5100`.
 
+## История Binance для обучения (§7.4)
+
+```bash
+uv run eratrade import-binance --since 2022-01-01   # BTCUSDT perp: свечи 1h, funding, premium
+uv run eratrade dataset                             # Binance добавляется в train автоматически
+uv run eratrade dataset --no-binance                # только Hyperliquid
+```
+
+Binance хранится отдельным рынком (`dex = binance-um`) и используется **только для обучения**:
+строки идут в train и только раньше начала истории Hyperliquid; validation / calibration / test —
+только Hyperliquid. На общем периоде источники сверяются (метки, доходность, каждый признак);
+признаки, которые расходятся (funding, premium, размер сделки), модель при обучении игнорирует —
+список пишется в манифест набора и в артефакт модели.
+
 ## Модели и сигналы (этап 11)
 
 ```bash

@@ -8,7 +8,7 @@ import json
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.config.settings import Network
 from app.domain.account import (
@@ -28,6 +28,10 @@ from app.domain.account import (
 )
 from app.domain.market import AssetContext, Candle, DataSource, FundingPoint, MarketMeta
 from app.integrations.hyperliquid.errors import HyperliquidFormatError
+
+if TYPE_CHECKING:
+    from app.market_data.flow import BookSnapshot
+    from app.market_data.flow import Trade as FlowTrade
 
 ISOLATED_ONLY_MARGIN_MODES = frozenset({"strictIsolated", "noCross"})
 
@@ -568,3 +572,49 @@ def parse_spot_usdc(data: Any) -> Decimal:
         if _str(balance, "coin", f"balances[{i}]") == "USDC":
             return _dec(balance, "total", f"balances[{i}]")
     return Decimal(0)
+
+
+def parse_ws_trades(data: Any, *, coin: str) -> list["FlowTrade"]:
+    """WS trades: [{coin, side: B|A (агрессор), px, sz, time, tid, ...}]."""
+    from app.market_data.flow import Trade as FlowTrade
+
+    trades = []
+    for i, item in enumerate(_list(data, "trades")):
+        what = f"trades[{i}]"
+        t = _obj(item, what)
+        if _str(t, "coin", what) != coin:
+            continue
+        side = _str(t, "side", what)
+        if side not in ("A", "B"):
+            raise HyperliquidFormatError(f"{what}: неизвестная сторона {side}")
+        trades.append(
+            FlowTrade(
+                time=_time(t, "time", what),
+                price=_dec(t, "px", what),
+                size=_dec(t, "sz", what),
+                is_buy=side == "B",
+                tid=_int(t, "tid", what),
+            )
+        )
+    return trades
+
+
+def parse_ws_l2book(data: Any, *, coin: str) -> "BookSnapshot | None":
+    """WS l2Book: {coin, time, levels: [[bids…], [asks…]]}, уровни {px, sz, n}."""
+    from app.market_data.flow import BookSnapshot
+
+    book = _obj(data, "l2Book")
+    if _str(book, "coin", "l2Book") != coin:
+        return None
+    levels = _list(_get(book, "levels", "l2Book"), "l2Book.levels")
+    if len(levels) != 2:
+        raise HyperliquidFormatError("l2Book: ожидается две стороны стакана")
+    sides = []
+    for k, side in enumerate(levels):
+        rows = []
+        for j, lvl in enumerate(_list(side, f"l2Book.levels[{k}]")):
+            what = f"l2Book.levels[{k}][{j}]"
+            entry = _obj(lvl, what)
+            rows.append((_dec(entry, "px", what), _dec(entry, "sz", what)))
+        sides.append(tuple(rows))
+    return BookSnapshot(time=_time(book, "time", "l2Book"), bids=sides[0], asks=sides[1])

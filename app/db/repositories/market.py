@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
@@ -10,12 +11,17 @@ from sqlalchemy.sql import func
 
 from app.config.settings import Network
 from app.db.models import (
+    BookStatsRecord,
     CandleRecord,
     FundingHistoryRecord,
     MarketContextSnapshotRecord,
     MarketRecord,
+    TradeFlowRecord,
 )
 from app.domain.market import AssetContext, Candle, FundingPoint, MarketMeta
+
+if TYPE_CHECKING:
+    from app.market_data.flow import BookBucket, FlowBucket
 
 # 14 параметров на свечу; у PostgreSQL предел 32767 параметров на запрос.
 CANDLE_BATCH_SIZE = 1000
@@ -295,3 +301,99 @@ async def get_last_funding_time(session: AsyncSession, market_id: int) -> dateti
         FundingHistoryRecord.market_id == market_id
     )
     return (await session.execute(stmt)).scalar_one_or_none()
+
+
+# --- поток сделок и стакан (копит коллектор) ---
+
+
+async def upsert_trade_flow(
+    session: AsyncSession, market_id: int, interval: str, buckets: Sequence["FlowBucket"]
+) -> int:
+    if not buckets:
+        return 0
+    rows = [
+        {
+            "market_id": market_id,
+            "interval": interval,
+            "open_time": b.open_time,
+            "complete": b.complete,
+            "buy_volume": b.buy_volume,
+            "sell_volume": b.sell_volume,
+            "buy_count": b.buy_count,
+            "sell_count": b.sell_count,
+            "buy_notional": b.buy_notional,
+            "sell_notional": b.sell_notional,
+            "large_buy_notional": b.large_buy_notional,
+            "large_sell_notional": b.large_sell_notional,
+        }
+        for b in buckets
+    ]
+    insert_stmt = insert(TradeFlowRecord).values(rows)
+    # Повторная запись той же корзины (рестарт) не должна затирать полную неполной.
+    stmt = insert_stmt.on_conflict_do_update(
+        index_elements=["market_id", "interval", "open_time"],
+        set_={
+            k: insert_stmt.excluded[k]
+            for k in rows[0]
+            if k not in ("market_id", "interval", "open_time")
+        },
+        where=TradeFlowRecord.complete.is_(False),
+    ).returning(TradeFlowRecord.open_time)
+    return len((await session.execute(stmt)).all())
+
+
+async def upsert_book_stats(
+    session: AsyncSession, market_id: int, interval: str, buckets: Sequence["BookBucket"]
+) -> int:
+    if not buckets:
+        return 0
+    rows = [
+        {
+            "market_id": market_id,
+            "interval": interval,
+            "open_time": b.open_time,
+            "complete": b.complete,
+            "samples": b.samples,
+            "spread_bps_mean": b.mean(b.spread_bps_sum),
+            "imbalance_top5_mean": b.mean(b.imbalance5_sum),
+            "imbalance_top20_mean": b.mean(b.imbalance20_sum),
+            "depth_top20_usd_mean": b.mean(b.depth20_usd_sum),
+            "last_imbalance_top5": b.last_imbalance5,
+        }
+        for b in buckets
+    ]
+    insert_stmt = insert(BookStatsRecord).values(rows)
+    stmt = insert_stmt.on_conflict_do_update(
+        index_elements=["market_id", "interval", "open_time"],
+        set_={
+            k: insert_stmt.excluded[k]
+            for k in rows[0]
+            if k not in ("market_id", "interval", "open_time")
+        },
+        where=BookStatsRecord.complete.is_(False),
+    ).returning(BookStatsRecord.open_time)
+    return len((await session.execute(stmt)).all())
+
+
+async def get_trade_flow(
+    session: AsyncSession, market_id: int, interval: str, *, start: datetime | None = None
+) -> list[TradeFlowRecord]:
+    stmt = select(TradeFlowRecord).where(
+        TradeFlowRecord.market_id == market_id, TradeFlowRecord.interval == interval
+    )
+    if start is not None:
+        stmt = stmt.where(TradeFlowRecord.open_time >= start)
+    return list((await session.execute(stmt.order_by(TradeFlowRecord.open_time))).scalars())
+
+
+async def flow_stats(
+    session: AsyncSession, market_id: int, interval: str
+) -> tuple[int, int, datetime | None]:
+    """(корзин потока, из них полных, последняя open_time)."""
+    stmt = select(
+        func.count(),
+        func.count().filter(TradeFlowRecord.complete.is_(True)),
+        func.max(TradeFlowRecord.open_time),
+    ).where(TradeFlowRecord.market_id == market_id, TradeFlowRecord.interval == interval)
+    total, complete, last = (await session.execute(stmt)).one()
+    return int(total), int(complete), last

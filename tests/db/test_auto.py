@@ -94,8 +94,16 @@ async def test_restart_downgrades_live_enabled(session: AsyncSession) -> None:
 
 
 async def test_gate_refuses_by_default(env: Env) -> None:
+    base = env.engine.strategy
+    # не зависим от того, что сейчас стоит в config/strategy.toml
+    strategy = base.model_copy(
+        update={
+            "auto": base.auto.model_copy(update={"enabled": False}),
+            "execution": base.execution.model_copy(update={"require_manual_confirmation": True}),
+        }
+    )
     async with env.sm() as db:
-        failures = await auto_failures(db, env.engine.market_id, env.engine.strategy, [])
+        failures = await auto_failures(db, env.engine.market_id, strategy, [])
     text = " | ".join(failures)
     assert "auto.enabled = false" in text
     assert "require_manual_confirmation = true" in text

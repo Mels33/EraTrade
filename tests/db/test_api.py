@@ -282,3 +282,13 @@ async def test_live_readiness_and_trades_endpoints(env: Env, api: httpx.AsyncCli
     await env.engine.sync_fills(env.clock() - timedelta(hours=1))
     trades = (await api.get("/api/trades", headers=AUTH)).json()
     assert trades[0]["side"] == "long" and trades[0]["notes"] == ["позиция открыта"]
+
+
+async def test_candles_endpoint(api: httpx.AsyncClient) -> None:
+    candles = (await api.get("/api/candles?hours=48", headers=AUTH)).json()
+    assert len(candles) == 20  # trading_env: 20 закрытых свечей до 12:00
+    assert candles[-1]["close"] == "65000" and isinstance(candles[0]["high"], str)
+    assert candles[0]["open_time"] < candles[-1]["open_time"]
+    assert (await api.get("/api/candles?hours=1", headers=AUTH)).status_code == 422
+    report = (await api.get("/api/shadow/report", headers=AUTH)).json()
+    assert report["live_min_outcomes"] == 50 and report["min_probability"] == 0.45

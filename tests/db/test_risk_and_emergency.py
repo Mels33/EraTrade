@@ -7,11 +7,11 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.config.settings import Network, Settings, TradingMode
 from app.config.strategy import DeadMansSwitchConfig
-from app.db.models import AuditLogRecord, FillRecord
+from app.db.models import AuditLogRecord, FillRecord, OrderRecord
 from app.db.repositories import control
 from app.domain.account import Side
 from app.domain.orders import OrderStatus
@@ -88,6 +88,10 @@ async def test_trades_per_day_limit(env: Env) -> None:
     assert any("лимит сделок" in r for r in fifth.order.guard_reasons)
     # Это не устойчивый запрет: на следующий день входы снова разрешены.
     assert not (await blocked(env))[0]
+    # created_at ставит PostgreSQL по настоящим часам, а «следующий день» — по часам
+    # движка: сдвигаем сегодняшние ордера в прошлое, чтобы тест не зависел от даты запуска.
+    async with env.sm.begin() as db:
+        await db.execute(update(OrderRecord).values(created_at=env.clock.now - timedelta(days=2)))
     env.clock.now += timedelta(days=1)
     nxt = await env.engine.open_position(
         Side.BUY, Decimal("15"), confirm=env.yes, stop_price=Decimal("64600")

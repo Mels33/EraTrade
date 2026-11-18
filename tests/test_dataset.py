@@ -150,8 +150,9 @@ def test_written_dataset_is_reproducible(
 
     header, first = csv_path.read_text().splitlines()[:2]
     columns = header.split(",")
-    assert columns[:4] == ["decision_time", "split", "label", "fwd_return"]
+    assert columns[:5] == ["decision_time", "split", "label", "fwd_return", "source"]
     assert len(first.split(",")) == len(columns)
     # repr(float) обратим: значения в CSV восстанавливаются бит в бит
     row = dataset.rows[0]
-    assert tuple(float(x) for x in first.split(",")[4:]) == row.features
+    assert first.split(",")[4] == "hyperliquid"
+    assert tuple(float(x) for x in first.split(",")[5:]) == row.features

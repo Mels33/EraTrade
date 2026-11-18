@@ -108,3 +108,41 @@ class FundingHistoryRecord(Base):
     funding_rate: Mapped[Decimal]
     premium: Mapped[Decimal]
     received_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class TradeFlowRecord(Base):
+    """Поток сделок по корзинам (агрессор покупает / продаёт). Копит коллектор."""
+
+    __tablename__ = "trade_flow"
+
+    market_id: Mapped[int] = mapped_column(ForeignKey("markets.id"), primary_key=True)
+    interval: Mapped[str] = mapped_column(primary_key=True)
+    open_time: Mapped[datetime] = mapped_column(primary_key=True)
+    complete: Mapped[bool]
+    buy_volume: Mapped[Decimal]
+    sell_volume: Mapped[Decimal]
+    buy_count: Mapped[int]
+    sell_count: Mapped[int]
+    buy_notional: Mapped[Decimal]
+    sell_notional: Mapped[Decimal]
+    large_buy_notional: Mapped[Decimal]
+    large_sell_notional: Mapped[Decimal]
+    received_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class BookStatsRecord(Base):
+    """Статистика стакана по корзинам (снимки ~раз в 10 с). Копит коллектор."""
+
+    __tablename__ = "book_stats"
+
+    market_id: Mapped[int] = mapped_column(ForeignKey("markets.id"), primary_key=True)
+    interval: Mapped[str] = mapped_column(primary_key=True)
+    open_time: Mapped[datetime] = mapped_column(primary_key=True)
+    complete: Mapped[bool]
+    samples: Mapped[int]
+    spread_bps_mean: Mapped[float | None]
+    imbalance_top5_mean: Mapped[float | None]
+    imbalance_top20_mean: Mapped[float | None]
+    depth_top20_usd_mean: Mapped[float | None]
+    last_imbalance_top5: Mapped[float | None]
+    received_at: Mapped[datetime] = mapped_column(server_default=func.now())

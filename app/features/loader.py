@@ -32,6 +32,7 @@ def candle_from_record(r: CandleRecord) -> Candle:
         is_closed=r.is_closed,
         source=DataSource(r.source),
         received_at=r.received_at,
+        raw=r.raw,
     )
 
 

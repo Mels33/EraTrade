@@ -11,10 +11,12 @@ from app.db.models.control import (
     NonceStateRecord,
 )
 from app.db.models.market import (
+    BookStatsRecord,
     CandleRecord,
     FundingHistoryRecord,
     MarketContextSnapshotRecord,
     MarketRecord,
+    TradeFlowRecord,
 )
 from app.db.models.models import FeatureSnapshotRecord, ModelVersionRecord, SignalRecord
 from app.db.models.reconciliation import (
@@ -36,6 +38,7 @@ __all__ = [
     "AccountSnapshotRecord",
     "ApiRequestRecord",
     "AuditLogRecord",
+    "BookStatsRecord",
     "BotStateRecord",
     "CandleRecord",
     "FeatureSnapshotRecord",
@@ -55,4 +58,5 @@ __all__ = [
     "ReconciliationDifferenceRecord",
     "ReconciliationRunRecord",
     "SignalRecord",
+    "TradeFlowRecord",
 ]

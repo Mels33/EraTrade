@@ -216,7 +216,18 @@ export interface ShadowReport {
   snapshots: number;
   min_outcomes_for_metrics: number;
   drift_sigma_warn: number;
+  live_min_outcomes: number;
+  min_probability: number;
   models: ShadowModel[];
+}
+
+export interface Candle {
+  open_time: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
 }
 
 export interface Readiness {
