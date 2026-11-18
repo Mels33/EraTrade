@@ -15,8 +15,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.config.settings import TradingMode
 from app.db.base import Base
-from app.db.models.market import NETWORK_CHECK
 
+NETWORK_CHECK = "network in ('testnet', 'mainnet')"
 _MODES = ", ".join(f"'{m.value}'" for m in TradingMode)
 
 

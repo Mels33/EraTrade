@@ -1,77 +1,61 @@
 // Управление ботом: панель действий и диалог подтверждения.
 
 import { useState } from "react";
-import { ApiError, command, type CommandResult } from "../api";
+import { ApiError, command, type CommandResult, type Status } from "../api";
+
+const PHRASE = "I_UNDERSTAND_REAL_MONEY";
 
 export interface CommandSpec {
-  id: string;
+  id: "start" | "pause" | "stop";
   label: string;
   path: string;
+  tone: "primary" | "warn" | "danger";
   confirm?: string; // слово, которое нужно ввести
-  danger: boolean;
-  needsEngine: boolean;
-  what: string; // что произойдёт
-  when: string; // когда использовать
+  phrase?: boolean; // отправить слово как confirmation_phrase
+  what: string;
 }
 
 export const COMMANDS: CommandSpec[] = [
   {
+    id: "start",
+    label: "Запустить торговлю",
+    path: "/api/bot/start",
+    tone: "primary",
+    confirm: PHRASE,
+    phrase: true,
+    what: "Снимает запрет входов и включает режим «Торгует»: маркет-мейкер начинает ставить заявки реальными деньгами.",
+  },
+  {
     id: "pause",
     label: "Пауза",
     path: "/api/bot/pause",
-    danger: false,
-    needsEngine: false,
-    what: "Запрещает новые сделки. Открытая позиция и её стоп остаются, закрыть её можно.",
-    when: "Что-то выглядит странно и нужно время разобраться.",
+    tone: "warn",
+    what: "Маркет-мейкер снимает все заявки. Открытая позиция остаётся — её можно закрыть кнопкой «Остановить».",
   },
   {
-    id: "resume",
-    label: "Снять запрет входов",
-    path: "/api/bot/resume",
-    danger: false,
-    needsEngine: false,
-    what: "Снимает запрет новых сделок. Режим работы не меняется.",
-    when: "Причина запрета разобрана и устранена.",
-  },
-  {
-    id: "flatten",
-    label: "Закрыть позицию",
-    path: "/api/bot/flatten",
-    confirm: "FLATTEN",
-    danger: true,
-    needsEngine: true,
-    what: "Закрывает позицию по рынку и снимает её защитный стоп.",
-    when: "Нужно выйти из сделки прямо сейчас.",
-  },
-  {
-    id: "cancel",
-    label: "Отменить все ордера",
-    path: "/api/bot/cancel-all",
-    confirm: "CANCEL_ALL",
-    danger: true,
-    needsEngine: true,
-    what: "Отменяет все ордера на бирже, включая защитный стоп. Позиция останется без защиты!",
-    when: "Только если на бирже висят лишние ордера.",
-  },
-  {
-    id: "kill",
-    label: "Аварийная остановка",
-    path: "/api/bot/kill-switch",
-    confirm: "KILL",
-    danger: true,
-    needsEngine: true,
-    what: "Пауза → закрыть позицию → отменить ордера → бот выключен.",
-    when: "Авария: нужно немедленно всё остановить.",
+    id: "stop",
+    label: "Остановить и закрыть позиции",
+    path: "/api/bot/stop",
+    tone: "danger",
+    confirm: "STOP",
+    what: "Режим «Выключен»: заявки снимаются, позиции маркет-мейкера закрываются по рынку.",
   },
 ];
 
+function available(c: CommandSpec, s: Status): boolean {
+  const live = s.mode === "LIVE_ENABLED" && !s.entries_blocked;
+  if (c.id === "start") return !live;
+  if (c.id === "pause") return live;
+  return s.mode !== "DISABLED";
+}
+
 export function ControlsPanel({
-  tradingAvailable,
+  status,
   onPick,
   onClose,
   onLogout,
 }: {
-  tradingAvailable: boolean;
+  status: Status;
   onPick: (c: CommandSpec) => void;
   onClose: () => void;
   onLogout: () => void;
@@ -80,26 +64,19 @@ export function ControlsPanel({
     <div className="overlay" role="dialog" aria-modal onClick={onClose}>
       <div className="sheet" onClick={(e) => e.stopPropagation()}>
         <header className="sheet-head">
-          <h3>Управление ботом</h3>
+          <h3>Управление</h3>
           <button className="icon-btn" onClick={onClose} aria-label="Закрыть">
             ✕
           </button>
         </header>
         <div className="actions-list">
           {COMMANDS.map((c) => {
-            const disabled = c.needsEngine && !tradingAvailable;
+            const ok = available(c, status);
             return (
-              <button
-                key={c.id}
-                className={`action-item ${c.danger ? "danger" : ""}`}
-                disabled={disabled}
-                onClick={() => onPick(c)}
-              >
+              <button key={c.id} className={`action-item ${c.tone}`} disabled={!ok} onClick={() => onPick(c)}>
                 <span className="action-title">{c.label}</span>
                 <span className="action-what">{c.what}</span>
-                <span className="action-when">
-                  {disabled ? "Недоступно: ключ API-кошелька не подключён к панели" : c.when}
-                </span>
+                {!ok && <span className="action-when">Сейчас не нужно</span>}
               </button>
             );
           })}
@@ -137,7 +114,7 @@ export function CommandDialog({
     setError(null);
     try {
       const body: Record<string, unknown> = { reason: reason.trim() };
-      if (spec.confirm) body.confirm = typed;
+      if (spec.phrase) body.confirmation_phrase = typed;
       setResult(await command<CommandResult>(spec.path, body, key));
       onDone();
     } catch (e) {
@@ -150,22 +127,22 @@ export function CommandDialog({
   return (
     <div className="overlay" role="dialog" aria-modal>
       <div className="dialog">
-        <h3 className={spec.danger ? "danger-text" : ""}>{spec.label}</h3>
+        <h3 className={spec.tone === "danger" ? "danger-text" : ""}>{spec.label}</h3>
         <p className="dialog-what">{spec.what}</p>
         {!result && (
           <>
             <label>
-              Причина — попадёт в журнал действий
+              Причина — попадёт в журнал
               <input
                 value={reason}
                 onChange={(e) => setReason(e.target.value)}
-                placeholder="например: разбираю расхождение со сверкой"
+                placeholder="например: проверяю настройки"
                 autoFocus
               />
             </label>
             {spec.confirm && (
               <label>
-                Чтобы подтвердить, введите <code>{spec.confirm}</code>
+                Для подтверждения введите <code>{spec.confirm}</code>
                 <input value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" />
               </label>
             )}
@@ -177,11 +154,6 @@ export function CommandDialog({
             {result.steps.map((s, i) => (
               <li key={i}>✓ {s}</li>
             ))}
-            {result.warnings?.map((w, i) => (
-              <li key={`w${i}`} className="error-text">
-                ⚠ {w}
-              </li>
-            ))}
           </ul>
         )}
         <div className="dialog-actions">
@@ -189,7 +161,7 @@ export function CommandDialog({
             {result ? "Готово" : "Отмена"}
           </button>
           {!result && (
-            <button className={`btn ${spec.danger ? "btn-danger" : "btn-primary"}`} disabled={!ready} onClick={submit}>
+            <button className={`btn btn-${spec.tone}`} disabled={!ready} onClick={submit}>
               {busy ? "Выполняется…" : spec.label}
             </button>
           )}

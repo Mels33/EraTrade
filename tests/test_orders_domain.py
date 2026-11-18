@@ -3,7 +3,6 @@ from decimal import Decimal
 
 import pytest
 
-from app.domain.indicators import atr, true_ranges
 from app.domain.orders import (
     InvalidTransitionError,
     OrderErrorCode,
@@ -122,15 +121,3 @@ class Bar:
     high: Decimal
     low: Decimal
     close: Decimal
-
-
-def test_atr_uses_previous_close_gaps() -> None:
-    bars = [
-        Bar(Decimal(h), Decimal(lo), Decimal(c))
-        for h, lo, c in [(10, 8, 9), (12, 11, 11.5), (11, 9, 10)]
-    ]
-    # TR2 = max(1, |12−9|, |11−9|) = 3; TR3 = max(2, |11−11.5|, |9−11.5|) = 2.5
-    assert true_ranges(bars) == [Decimal(3), Decimal("2.5")]
-    assert atr(bars, 2) == Decimal("2.75")
-    with pytest.raises(ValueError, match="нужно 4"):
-        atr(bars, 3)

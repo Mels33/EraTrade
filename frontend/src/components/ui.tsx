@@ -10,7 +10,7 @@ export function Card({
   children,
   className = "",
 }: {
-  title?: string;
+  title?: ReactNode;
   hint?: string;
   action?: ReactNode;
   children: ReactNode;
@@ -40,8 +40,8 @@ export function Help({ text }: { text: string }) {
   );
 }
 
-export function Dot({ tone }: { tone: Tone }) {
-  return <span className={`dot ${tone}`} aria-hidden />;
+export function Dot({ tone, pulse = false }: { tone: Tone; pulse?: boolean }) {
+  return <span className={`dot ${tone} ${pulse ? "pulse" : ""}`} aria-hidden />;
 }
 
 export function Pill({ tone, children }: { tone: Tone | "up" | "down" | "flat"; children: ReactNode }) {
@@ -80,32 +80,59 @@ export function ErrorText({ children }: { children: ReactNode }) {
   return <p className="error-text">{children}</p>;
 }
 
-/** Горизонтальная полоса: доля использования лимита. */
-export function Meter({
-  value,
-  max,
-  label,
-  right,
-  caption,
-}: {
-  value: number;
-  max: number;
-  label: string;
-  right: ReactNode;
-  caption?: ReactNode;
-}) {
-  const share = max > 0 ? Math.min(1, Math.max(0, value / max)) : 0;
-  const tone = share >= 1 ? "bad" : share >= 0.6 ? "warn" : "ok";
+/** Доля использования лимита: 0..1. */
+export function Meter({ share, label, right }: { share: number; label: ReactNode; right: ReactNode }) {
+  const s = Math.min(1, Math.max(0, Number.isFinite(share) ? share : 0));
+  const tone = s >= 0.85 ? "bad" : s >= 0.5 ? "warn" : "ok";
   return (
     <div className="meter">
       <div className="meter-head">
         <span>{label}</span>
-        <span>{right}</span>
+        <span className="num">{right}</span>
       </div>
       <div className="meter-track">
-        <div className={`meter-fill ${tone}`} style={{ width: `${Math.max(share * 100, share > 0 ? 2 : 0)}%` }} />
+        <div className={`meter-fill ${tone}`} style={{ width: `${Math.max(s * 100, s > 0 ? 2 : 0)}%` }} />
       </div>
-      {caption && <div className="meter-caption">{caption}</div>}
+    </div>
+  );
+}
+
+/** Шкала от −max до +max с заполнением от центра (позиция, поток сделок). */
+export function CenterGauge({
+  value,
+  max,
+  label,
+  text,
+  left,
+  right,
+}: {
+  value: number;
+  max: number;
+  label: string;
+  text: ReactNode;
+  left: string;
+  right: string;
+}) {
+  const v = Number.isFinite(value) ? Math.max(-1, Math.min(1, value / max)) : 0;
+  const width = Math.abs(v) * 50;
+  return (
+    <div className="gauge">
+      <div className="meter-head">
+        <span>{label}</span>
+        <span className="num">{text}</span>
+      </div>
+      <div className="gauge-track">
+        <div className="gauge-mid" />
+        <div
+          className={`gauge-fill ${v >= 0 ? "pos" : "neg"}`}
+          style={v >= 0 ? { left: "50%", width: `${width}%` } : { left: `${50 - width}%`, width: `${width}%` }}
+        />
+      </div>
+      <div className="gauge-scale">
+        <span>{left}</span>
+        <span>0</span>
+        <span>{right}</span>
+      </div>
     </div>
   );
 }

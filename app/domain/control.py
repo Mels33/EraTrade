@@ -1,4 +1,4 @@
-"""Правила смены режима работы бота (docs/spec.md, §6). Чистые функции без БД."""
+"""Правила смены режима работы бота. Чистые функции без БД."""
 
 from dataclasses import dataclass
 from enum import StrEnum

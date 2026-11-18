@@ -21,12 +21,9 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier
 
-from app.features.target import CLASSES
-from app.models.calibration import fit_temperature, softmax
-from app.models.execution_model import Costs, simulate
-from app.models.experiment import Trade, choose_theta
-from app.models.training import CATBOOST_PARAMS
-from app.models.walkforward import make_folds, summarize
+from app.research.calibration import fit_temperature, softmax
+from app.research.evaluation import CLASSES, Trade, choose_theta, make_folds, summarize
+from app.research.execution_model import Costs, simulate
 from app.research.features_micro import compute, feature_set
 
 MINUTE = timedelta(minutes=1)
@@ -37,11 +34,19 @@ COST_MODELS: tuple[str, ...] = ("gross", "taker", "maker")
 EDGE: dict[str, float] = {"gross": 0.0, "taker": 0.0014, "maker": 0.0006}
 ZERO_COSTS = Costs(maker_fee=0.0, taker_fee=0.0, half_spread=0.0, slippage=0.0)
 THETAS = [round(0.34 + 0.02 * i, 2) for i in range(24)]  # 0.34 … 0.80
-FAST_CATBOOST: dict[str, Any] = {
+CATBOOST_PARAMS: dict[str, Any] = {
+    "loss_function": "MultiClass",
     "learning_rate": 0.08,
     "iterations": 1200,
+    "depth": 4,
+    "l2_leaf_reg": 10,
+    "random_seed": 42,
+    "od_type": "Iter",
     "od_wait": 60,
+    "use_best_model": True,
     "thread_count": 8,
+    "allow_writing_files": False,
+    "verbose": False,
 }
 
 
@@ -218,7 +223,7 @@ def walk_forward_micro(
     view = BarView(
         bars["high"].to_numpy(float), bars["low"].to_numpy(float), bars["close"].to_numpy(float)
     )
-    params = {**CATBOOST_PARAMS, **FAST_CATBOOST, **(catboost_params or {})}
+    params = {**CATBOOST_PARAMS, **(catboost_params or {})}
     row_times = times[rows]
 
     def span(a: datetime, b: datetime) -> np.ndarray:

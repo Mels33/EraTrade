@@ -1,68 +1,16 @@
-"""Загрузка торговой и риск-спецификации из config/strategy.toml (см. docs/spec.md)."""
+"""Конфигурация стратегии из config/strategy.toml: маркет-мейкинг (секция [mm])."""
 
 import tomllib
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SUPPORTED_SPEC_VERSION = 1
+SUPPORTED_SPEC_VERSION = 2
 
 
 class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-
-
-class MarketConfig(_Frozen):
-    coin: str = Field(min_length=1)
-    interval: Literal["1h"]
-    horizon_candles: int = Field(gt=0)
-    margin_mode: Literal["isolated"]
-    leverage: int = Field(ge=1)
-
-
-class PolicyConfig(_Frozen):
-    allow_long: bool
-    allow_short: bool
-    allow_reversal: Literal[False]
-    time_exit_candles: int = Field(gt=0)
-    reentry_cooldown_candles: int = Field(ge=1)
-
-
-class SizingConfig(_Frozen):
-    fixed_risk_usdc: Decimal = Field(gt=0)
-    risk_fraction: Decimal = Field(gt=0, le=Decimal("0.05"))
-    stop_atr_period: int = Field(gt=1)
-    stop_atr_multiplier: Decimal = Field(gt=0)
-    min_stop_distance_fraction: Decimal = Field(gt=0, lt=1)
-    min_order_notional_usdc: Decimal = Field(gt=0)
-
-
-class LimitsConfig(_Frozen):
-    max_position_notional_usdc: Decimal = Field(gt=0)
-    max_leverage: int = Field(ge=1)
-    max_daily_loss_fraction: Decimal = Field(gt=0, lt=1)
-    max_weekly_loss_fraction: Decimal = Field(gt=0, lt=1)
-    max_trades_per_day: int = Field(gt=0)
-    max_spread_bps: Decimal = Field(gt=0)
-    max_slippage_bps: Decimal = Field(gt=0)
-
-
-class FreshnessConfig(_Frozen):
-    max_decision_delay_seconds: int = Field(gt=0)
-    max_ws_silence_seconds: int = Field(gt=0)
-    max_unknown_order_seconds: int = Field(gt=0)
-
-
-class ExecutionConfig(_Frozen):
-    stop_market_slippage_bps: Decimal = Field(gt=0, le=Decimal("2000"))
-    require_manual_confirmation: bool
-
-
-class RiskConfig(_Frozen):
-    loss_includes_unrealized: bool
-    address_requests_warning: int = Field(ge=0)
 
 
 class DeadMansSwitchConfig(_Frozen):
@@ -77,87 +25,55 @@ class DeadMansSwitchConfig(_Frozen):
         return self
 
 
-class TargetConfig(_Frozen):
-    """Разметка обучающего набора (§14.2): порог класса = издержки сделки + запас + край."""
+class MmConfig(_Frozen):
+    """Маркет-мейкинг (config/strategy.toml, секция [mm])."""
 
-    taker_fee_bps: Decimal = Field(ge=0)  # за одну сторону
-    expected_spread_bps: Decimal = Field(ge=0)  # полный спред, платится один раз за сделку
-    expected_slippage_bps: Decimal = Field(ge=0)  # за одну сторону
-    expected_funding_bps: Decimal = Field(ge=0)  # за горизонт
-    safety_margin_bps: Decimal = Field(ge=0)
-    min_edge_bps: Decimal = Field(gt=0)
+    coins: tuple[str, ...] = ()  # стартовые монеты (при auto_select — до первого пересмотра)
+    auto_select: bool = False
+    max_coins: int = Field(default=2, ge=1, le=5)
+    rescan_minutes: int = Field(default=180, ge=10)
+    select_min_spread_bps: Decimal = Field(default=Decimal(5), gt=0)
+    select_max_spread_bps: Decimal = Field(default=Decimal(30), gt=0)
+    select_min_volume_usd: Decimal = Field(default=Decimal(2_000_000), ge=0)
+    select_hysteresis: float = Field(default=0.3, ge=0)
+    exclude: tuple[str, ...] = ()
+    retire_flatten_minutes: int = Field(default=60, ge=1)
+    order_usd: Decimal = Field(default=Decimal(12), ge=10)  # биржевой минимум 10 USDC
+    max_inventory_usd: Decimal = Field(default=Decimal(25), gt=0)
+    daily_loss_usd: Decimal = Field(default=Decimal(2), gt=0)
+    leverage: int = Field(default=3, ge=1)
+    min_spread_bps: Decimal = Field(default=Decimal(4), gt=0)
+    improve_min_ticks: int = Field(default=3, ge=2)
+    flow_window_seconds: float = Field(default=30, gt=0)
+    flow_min_usd: Decimal = Field(default=Decimal(1000), ge=0)
+    flow_pull_imbalance: float = Field(default=0.6, gt=0, le=1)
+    requote_min_interval_seconds: float = Field(default=3, ge=0)
+    max_actions_per_minute: int = Field(default=12, ge=2)
+    min_requests_remaining: int = Field(default=20_000, ge=0)
+    stale_book_seconds: float = Field(default=10, gt=0)
+    sync_seconds: float = Field(default=5, gt=0)
+    dms_horizon_seconds: int = Field(default=120, ge=10)
+    dms_refresh_seconds: int = Field(default=60, ge=5)
 
-    @property
-    def cost_bps(self) -> Decimal:
-        """Ожидаемые издержки сделки туда-обратно."""
-        return (
-            2 * self.taker_fee_bps
-            + self.expected_spread_bps
-            + 2 * self.expected_slippage_bps
-            + self.expected_funding_bps
-        )
-
-    @property
-    def threshold_bps(self) -> Decimal:
-        return self.cost_bps + self.safety_margin_bps + self.min_edge_bps
-
-
-class SignalConfig(_Frozen):
-    """Пороги торговой политики (§15.2)."""
-
-    min_probability: Decimal = Field(gt=0, lt=1)
-    min_margin: Decimal = Field(ge=0, lt=1)
-
-
-class LiveConfig(_Frozen):
-    """Требования к shadow-доказательствам и эксплуатации перед live (этап 14)."""
-
-    min_shadow_outcomes: int = Field(ge=1)
-    max_shadow_error_rate: Decimal = Field(ge=0, le=1)
-    min_shadow_coverage: Decimal = Field(ge=0, le=1)
-    require_beats_baseline: bool
-    max_backup_age_hours: int = Field(gt=0)
-    max_restore_check_age_days: int = Field(gt=0)
-    min_wallet_valid_days: int = Field(ge=0)
-
-
-class AutoConfig(_Frozen):
-    """Автоматическое исполнение (этап 15)."""
-
-    enabled: bool
-    min_manual_trades: int = Field(ge=1)
-    pause_on_warnings: bool
+    @model_validator(mode="after")
+    def _consistent(self) -> "MmConfig":
+        if self.max_inventory_usd < self.order_usd:
+            raise ValueError("mm.max_inventory_usd должен быть не меньше mm.order_usd")
+        if self.dms_refresh_seconds >= self.dms_horizon_seconds:
+            raise ValueError("mm.dms_refresh_seconds должен быть меньше dms_horizon_seconds")
+        return self
 
 
 class StrategyConfig(_Frozen):
     spec_version: int
-    market: MarketConfig
-    policy: PolicyConfig
-    sizing: SizingConfig
-    limits: LimitsConfig
-    freshness: FreshnessConfig
-    execution: ExecutionConfig
-    risk: RiskConfig
-    dead_mans_switch: DeadMansSwitchConfig
-    target: TargetConfig
-    signal: SignalConfig
-    live: LiveConfig
-    auto: AutoConfig
+    mm: MmConfig = MmConfig()
 
     @model_validator(mode="after")
-    def _check_cross_fields(self) -> "StrategyConfig":
+    def _check_version(self) -> "StrategyConfig":
         if self.spec_version != SUPPORTED_SPEC_VERSION:
             raise ValueError(
                 f"spec_version={self.spec_version}, поддерживается {SUPPORTED_SPEC_VERSION}"
             )
-        if self.market.leverage > self.limits.max_leverage:
-            raise ValueError("market.leverage превышает limits.max_leverage")
-        if self.limits.max_weekly_loss_fraction < self.limits.max_daily_loss_fraction:
-            raise ValueError("недельный лимит убытка меньше дневного")
-        if self.sizing.min_order_notional_usdc > self.limits.max_position_notional_usdc:
-            raise ValueError("минимальный номинал ордера больше максимального номинала позиции")
-        if not (self.policy.allow_long or self.policy.allow_short):
-            raise ValueError("запрещены и long, и short")
         return self
 
 

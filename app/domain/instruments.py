@@ -82,14 +82,19 @@ class InstrumentRules:
 
     # --- цена ---
 
-    def round_price(self, price: Decimal, rounding: Rounding) -> Decimal:
+    def tick(self, price: Decimal) -> Decimal:
+        """Шаг цены около price: более грубое из двух ограничений; шаг крупнее 1 не нужен —
+        целые цены разрешены."""
         if price <= 0:
             raise PrecisionError("цена должна быть положительной")
         decimals_quantum = _quantum(self.max_price_decimals)
         sig_quantum = Decimal(1).scaleb(price.adjusted() - (MAX_SIGNIFICANT_FIGURES - 1))
-        # Более грубое из двух ограничений; шаг крупнее 1 не нужен — целые цены разрешены.
-        quantum = min(max(decimals_quantum, sig_quantum), Decimal(1))
-        result = price.quantize(quantum, rounding=rounding.decimal_mode)
+        return min(max(decimals_quantum, sig_quantum), Decimal(1))
+
+    def round_price(self, price: Decimal, rounding: Rounding) -> Decimal:
+        if price <= 0:
+            raise PrecisionError("цена должна быть положительной")
+        result = price.quantize(self.tick(price), rounding=rounding.decimal_mode)
         if result <= 0:
             raise PrecisionError(f"цена {price} слишком мала для {self.coin}")
         # Перенос разряда при округлении вверх (99999.5 → 100000) даёт только хвостовые нули,

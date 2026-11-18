@@ -1,54 +1,59 @@
 """API панели (§13): аутентификация, чтение, управляющие команды и идемпотентность."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import timedelta
-from decimal import Decimal
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.app import create_api
 from app.api.context import ApiContext
-from app.config.settings import Settings, TradingMode
+from app.config.settings import Network, Settings, TradingMode
+from app.config.strategy import load_strategy
 from app.db.models import AuditLogRecord
 from app.db.repositories import control
-from app.domain.account import Side
-from app.execution.engine import ExecutionEngine
+from app.observability.notify import LogNotifier
 from tests.db.constants import TEST_DB_URL
-from tests.db.trading_env import ACCOUNT, Env
 
 TOKEN = "operator-test-token-123"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+NOW = datetime(2026, 11, 1, 12, tzinfo=UTC)
 
 
-def make_context(env: Env, *, with_engine: bool = True) -> ApiContext:
+@dataclass
+class Env:
+    sm: async_sessionmaker[AsyncSession]
+    clock: Callable[[], datetime]
+    notifier: LogNotifier
+
+
+@pytest.fixture
+async def env(committing_sessionmaker: async_sessionmaker[AsyncSession]) -> Env:
+    async with committing_sessionmaker.begin() as db:
+        state = await control.ensure_bot_state(db, Network.TESTNET)
+        state.trading_mode = TradingMode.TESTNET.value
+    return Env(committing_sessionmaker, lambda: NOW, LogNotifier())
+
+
+def make_context(env: Env) -> ApiContext:
     settings = Settings(
         _env_file=None,
         environment="testnet",
         hyperliquid_network="testnet",
         database_url=TEST_DB_URL,
-        hl_account_address=ACCOUNT,
         api_token=TOKEN,
     )
-
-    @asynccontextmanager
-    async def engine_factory() -> AsyncIterator[ExecutionEngine]:
-        yield env.engine
-
     return ApiContext(
         settings=settings,
         sm=env.sm,
-        gateway=env.engine.gateway,
-        strategy=env.engine.strategy,
-        market_id=env.engine.market_id,
-        coin=env.engine.coin,
-        user=ACCOUNT,
-        risk=env.engine.risk,
+        strategy=load_strategy(Path("config/strategy.toml")),
         notifier=env.notifier,
-        engine_factory=engine_factory if with_engine else None,
         clock=env.clock,
     )
 
@@ -118,25 +123,7 @@ async def test_reads_require_operator_token(
 async def test_status(api: httpx.AsyncClient) -> None:
     body = (await api.get("/api/status", headers=AUTH)).json()
     assert body["network"] == "testnet" and body["mode"] == "TESTNET"
-    assert body["coin"] == "BTC" and body["trading_commands_available"] is True
-    assert body["data"]["last_closed_candle"] is not None
-
-
-async def test_account_and_orders_use_string_decimals(env: Env, api: httpx.AsyncClient) -> None:
-    await env.engine.open_position(Side.BUY, Decimal("15"), confirm=env.yes)
-    account = (await api.get("/api/account", headers=AUTH)).json()
-    assert account["position"]["size"] == "0.00023"
-    assert account["risk"]["equity"] == "98.45"
-    assert [o["reduce_only"] for o in account["open_orders"]] == [True]
-
-    orders = (await api.get("/api/orders", headers=AUTH)).json()
-    assert {o["purpose"] for o in orders} == {"entry", "stop"}
-    assert all(isinstance(o["size"], str) for o in orders)
-    assert (await api.get("/api/positions", headers=AUTH)).json()["position"]["size"] == "0.00023"
-    assert "daily_limit" in (await api.get("/api/risk", headers=AUTH)).json()
-    assert (await api.get("/api/audit", headers=AUTH)).status_code == 200
-    assert (await api.get("/api/fills", headers=AUTH)).status_code == 200
-    assert (await api.get("/api/signals", headers=AUTH)).json()["items"] == []
+    assert "trading_commands_available" not in body
 
 
 async def test_pause_requires_key_and_reason_and_is_idempotent(
@@ -172,123 +159,53 @@ async def test_mode_change_rules_apply(api: httpx.AsyncClient) -> None:
     assert ok.status_code == 200 and ok.json()["steps"] == ["режим DISABLED"]
 
 
-async def test_dangerous_commands_require_explicit_confirm(
-    env: Env, api: httpx.AsyncClient
-) -> None:
-    opened = await env.engine.open_position(Side.BUY, Decimal("15"), confirm=env.yes)
-    assert opened.stop is not None
-    missing = await post(api, "/api/bot/cancel-all", {"reason": "тест отмены"}, key="c1")
-    assert missing.status_code == 422 and "CANCEL_ALL" in missing.json()["detail"]
+async def test_mm_endpoint(env: Env, api: httpx.AsyncClient) -> None:
+    from app.db.repositories import control
+    from app.db.repositories import mm as mm_repo
+    from app.integrations.hyperliquid.parsing import datetime_to_ms, parse_fill
 
-    done = await post(
-        api, "/api/bot/cancel-all", {"reason": "тест отмены", "confirm": "CANCEL_ALL"}, key="c2"
+    now = env.clock()
+    fill = parse_fill(
+        {
+            "coin": "FARTCOIN", "side": "A", "px": "0.0866", "sz": "140",
+            "time": datetime_to_ms(now),
+            "startPosition": "140", "dir": "Close Long", "closedPnl": "0.014", "fee": "0.0018",
+            "feeToken": "USDC", "oid": 5, "tid": 9, "hash": "0x0", "crossed": False,
+        }
+    )  # fmt: skip
+    async with env.sm.begin() as db:
+        assert await mm_repo.add_fills(db, [fill]) == {9}
+        await control.beat(
+            db, component="mm", instance_id="t", started_at=now, now=now,
+            details={"state": "котирует", "quoting": True, "coins": {}},
+        )  # fmt: skip
+    data = (await api.get("/api/mm", headers=AUTH)).json()
+    assert data["config"]["coins"] == ["FARTCOIN", "VVV"]
+    assert data["live"]["state"] == "котирует"
+    assert data["fills"][0]["notional"] == "12.12" and data["fills"][0]["side"] == "sell"
+    [day] = data["daily"]
+    assert day["coin"] == "FARTCOIN" and day["fills"] == 1 and day["net"] == "0.0122"
+
+
+async def test_start_and_stop_for_market_maker(env: Env, api: httpx.AsyncClient) -> None:
+    await post(api, "/api/bot/pause", {"reason": "перед запуском"}, key="p0")
+    bad = await post(
+        api, "/api/bot/start", {"reason": "запуск", "confirmation_phrase": "да"}, key="s0"
     )
-    assert done.status_code == 200
-    assert any("БЕЗ стопа" in w for w in done.json()["warnings"])
+    assert bad.status_code == 422
+    async with env.sm() as db:
+        state = await control.get_bot_state(db)
+    assert state is not None and state.entries_blocked  # ничего не изменилось
 
+    # В testnet LIVE_ENABLED недопустим: снятие запрета откатывается вместе с отказом.
+    phrase = {"reason": "запуск", "confirmation_phrase": "I_UNDERSTAND_REAL_MONEY"}
+    assert (await post(api, "/api/bot/start", phrase, key="s1")).status_code == 422
+    async with env.sm() as db:
+        state = await control.get_bot_state(db)
+    assert state is not None and state.entries_blocked
 
-async def test_kill_switch_via_api(env: Env, api: httpx.AsyncClient) -> None:
-    await env.engine.open_position(Side.BUY, Decimal("15"), confirm=env.yes)
-    before = await last_audit_id(env)
-    response = await post(
-        api, "/api/bot/kill-switch", {"reason": "авария", "confirm": "KILL"}, key="k"
-    )
-    assert response.status_code == 200, response.text
-    assert env.fake.position == 0
+    stop = await post(api, "/api/bot/stop", {"reason": "конец дня"}, key="st")
+    assert stop.status_code == 200 and "DISABLED" in stop.json()["steps"][0]
     async with env.sm() as db:
         state = await control.get_bot_state(db)
     assert state is not None and state.trading_mode == TradingMode.DISABLED.value
-    assert await audit_count(env, "emergency.full_kill", before) == 1
-
-
-async def test_trading_commands_unavailable_without_key(env: Env) -> None:
-    async with client_for(make_context(env, with_engine=False)) as client:
-        response = await post(
-            client, "/api/bot/flatten", {"reason": "нет ключа", "confirm": "FLATTEN"}, key="f"
-        )
-    assert response.status_code == 503
-
-
-async def _add_model(env: Env, version: str, status: str, *, was_active: bool = False) -> None:
-    from datetime import UTC, datetime
-
-    from app.db.models import ModelVersionRecord
-
-    artifact = {
-        "metrics": {"test": {"log_loss": 0.99, "baseline_log_loss": 1.03, "policy": None}},
-        "target": {"horizon_candles": 4},
-    }
-    async with env.sm.begin() as db:
-        db.add(
-            ModelVersionRecord(
-                version=version,
-                status=status,
-                feature_set_version="v1",
-                model_sha256="0" * 64,
-                artifact_path=version,
-                artifact=artifact,
-                activated_at=datetime(2026, 11, 1, tzinfo=UTC) if was_active else None,
-            )
-        )
-
-
-async def test_models_list_and_activation(env: Env, api: httpx.AsyncClient) -> None:
-    await _add_model(env, "cb-test-shadow", "shadow")
-    await _add_model(env, "cb-test-candidate", "candidate")
-    await _add_model(env, "cb-test-old", "retired", was_active=True)
-    items = (await api.get("/api/models", headers=AUTH)).json()["items"]
-    assert {m["version"]: m["status"] for m in items} == {
-        "cb-test-shadow": "shadow",
-        "cb-test-candidate": "candidate",
-        "cb-test-old": "retired",
-    }
-    assert items[0]["test"]["log_loss"] == 0.99
-
-    no_confirm = await post(
-        api, "/api/models/cb-test-shadow/activate", {"reason": "без слова"}, "a1"
-    )
-    assert no_confirm.status_code == 422 and "ACTIVATE" in no_confirm.json()["detail"]
-    # shadow без накопленных сигналов — доказательств нет, активировать нельзя
-    no_evidence = await post(
-        api,
-        "/api/models/cb-test-shadow/activate",
-        {"reason": "рано", "confirm": "ACTIVATE"},
-        "a2",
-    )
-    assert no_evidence.status_code == 422 and "доказательств" in no_evidence.json()["detail"]
-    # откат на прежнюю активную модель доказательств не требует
-    rollback = await post(
-        api,
-        "/api/models/cb-test-old/activate",
-        {"reason": "откат", "confirm": "ACTIVATE"},
-        "a3",
-    )
-    assert rollback.status_code == 200 and rollback.json()["steps"] == ["cb-test-old: active"]
-    assert (await api.get("/api/signals", headers=AUTH)).json()["items"] == []
-
-
-async def test_shadow_report_endpoint(api: httpx.AsyncClient) -> None:
-    body = (await api.get("/api/shadow/report?days=3", headers=AUTH)).json()
-    assert body["models"] == [] and "snapshots" in body
-    assert (await api.get("/api/shadow/report?days=0", headers=AUTH)).status_code == 422
-
-
-async def test_live_readiness_and_trades_endpoints(env: Env, api: httpx.AsyncClient) -> None:
-    body = (await api.get("/api/live/readiness", headers=AUTH)).json()
-    assert body["summary"] == "fail"  # testnet, нет активной модели и т.д.
-    assert {c["name"] for c in body["checks"]} >= {"сеть", "активная модель", "бэкап БД"}
-
-    await env.engine.open_position(Side.BUY, Decimal("15"), confirm=env.yes)
-    await env.engine.sync_fills(env.clock() - timedelta(hours=1))
-    trades = (await api.get("/api/trades", headers=AUTH)).json()
-    assert trades[0]["side"] == "long" and trades[0]["notes"] == ["позиция открыта"]
-
-
-async def test_candles_endpoint(api: httpx.AsyncClient) -> None:
-    candles = (await api.get("/api/candles?hours=48", headers=AUTH)).json()
-    assert len(candles) == 20  # trading_env: 20 закрытых свечей до 12:00
-    assert candles[-1]["close"] == "65000" and isinstance(candles[0]["high"], str)
-    assert candles[0]["open_time"] < candles[-1]["open_time"]
-    assert (await api.get("/api/candles?hours=1", headers=AUTH)).status_code == 422
-    report = (await api.get("/api/shadow/report", headers=AUTH)).json()
-    assert report["live_min_outcomes"] == 50 and report["min_probability"] == 0.45

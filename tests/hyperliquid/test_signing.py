@@ -196,3 +196,44 @@ def test_cloids_are_unique_and_valid() -> None:
     cloids = {actions.new_cloid() for _ in range(10_000)}
     assert len(cloids) == 10_000
     assert all(actions.validate_cloid(c) == c for c in cloids)
+
+
+def test_batch_modify_and_cancels_match_sdk() -> None:
+    order = OrderRequest(
+        asset=7,
+        is_buy=False,
+        price=Decimal("0.08661"),
+        size=Decimal("139"),
+        reduce_only=False,
+        order_type=LimitOrderType(Tif.ALO),
+        cloid=CLOID,
+    )
+    sdk_order = order_request_to_order_wire(
+        {
+            "coin": "X",
+            "is_buy": False,
+            "sz": 139.0,
+            "limit_px": 0.08661,
+            "order_type": {"limit": {"tif": "Alo"}},
+            "reduce_only": False,
+            "cloid": Cloid(CLOID),
+        },
+        7,
+    )
+    old_cloid = "0x" + "cd" * 16
+    ours = actions.batch_modify_action([(123456, order), (old_cloid, order)])
+    sdk = {
+        "type": "batchModify",
+        "modifies": [
+            {"oid": 123456, "order": sdk_order},
+            {"oid": Cloid(old_cloid).to_raw(), "order": sdk_order},
+        ],
+    }
+    assert ours == sdk
+    assert same_hash(ours, sdk)
+    signer = ActionSigner(SecretStr(TEST_KEY), is_mainnet=True)
+    assert signer.sign(ours, NONCE, None)["action"]["type"] == "batchModify"
+
+    cancels = actions.cancel_many_action([(7, 1), (8, 2)])
+    assert cancels == {"type": "cancel", "cancels": [{"a": 7, "o": 1}, {"a": 8, "o": 2}]}
+    assert actions.action_weight(ours) == 1

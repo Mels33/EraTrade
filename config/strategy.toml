@@ -1,97 +1,33 @@
-# Торговая и риск-спецификация EraTrade. Описание: docs/spec.md
-# Денежные и дробные значения записаны строками, чтобы читаться как Decimal без потерь.
+# Конфигурация EraTrade: маркет-мейкинг на Hyperliquid.
+spec_version = 2
 
-spec_version = 1
+[mm]
+# Маркет-мейкинг: котировки post-only (ALO) с обеих сторон стакана на монетах со спредом шире
+# комиссии maker (1.5 bp × 2). Котирует только в режиме LIVE_ENABLED и без запрета входов.
+coins = ["FARTCOIN", "VVV"]   # стартовые монеты; при auto_select бот выбирает сам
+auto_select = true          # раз в rescan_minutes выбирать лучшие монеты сканером
+max_coins = 2
+rescan_minutes = 180
+select_min_spread_bps = 5   # медианный спред кандидата (запас над порогом котирования)
+select_max_spread_bps = 30  # шире — «мёртвый» рынок с резкими скачками
+select_min_volume_usd = 2000000
+select_hysteresis = 0.3     # заменить текущую монету, только если кандидат лучше на 30%
+exclude = []                # монеты, которые никогда не торговать
+retire_flatten_minutes = 60 # уходим с монеты: столько ждём закрытия позиции заявкой, потом по рынку
+order_usd = 12              # размер заявки (биржевой минимум 10 USDC)
+max_inventory_usd = 25      # предел позиции по монете в любую сторону
+daily_loss_usd = 2          # реализованный + нереализованный PnL за сутки UTC → стоп, закрыть, запрет
+leverage = 3                # isolated
+min_spread_bps = 4          # уже — не котировать
+improve_min_ticks = 3       # спред ≥ N шагов цены → встать на шаг лучше лучшей цены
+flow_window_seconds = 30    # окно потока агрессивных сделок
+flow_min_usd = 1000         # меньше оборота в окне — поток не учитывается
+flow_pull_imbalance = 0.6   # |покупки − продажи| / сумма ≥ порога → снять сторону против потока
+requote_min_interval_seconds = 3
+max_actions_per_minute = 12 # заявки/отмены/перестановки (лимит запросов адреса)
+min_requests_remaining = 20000
+stale_book_seconds = 10     # стакан не обновлялся дольше — снять котировки
+sync_seconds = 5            # сверка позиции и заявок с биржей
+dms_horizon_seconds = 120   # scheduleCancel: биржа снимет заявки, если процесс завис/упал
+dms_refresh_seconds = 60
 
-[market]
-coin = "BTC"
-interval = "1h"
-horizon_candles = 4
-margin_mode = "isolated"
-leverage = 2
-
-[policy]
-allow_long = true
-allow_short = true
-allow_reversal = false
-time_exit_candles = 8
-reentry_cooldown_candles = 1
-
-[sizing]
-fixed_risk_usdc = "10"
-risk_fraction = "0.005"          # 0.5% equity
-stop_atr_period = 14
-stop_atr_multiplier = "1.5"
-min_stop_distance_fraction = "0.005"  # 0.5% цены
-min_order_notional_usdc = "10"
-
-[limits]
-max_position_notional_usdc = "20"  # технические тесты на mainnet; 200 — после этапа 14
-max_leverage = 2
-max_daily_loss_fraction = "0.02"   # 2% equity
-max_weekly_loss_fraction = "0.05"  # 5% equity
-max_trades_per_day = 4
-max_spread_bps = "5"
-max_slippage_bps = "10"
-
-[freshness]
-max_decision_delay_seconds = 90
-max_ws_silence_seconds = 30
-max_unknown_order_seconds = 30
-
-[execution]
-# Лимит stop-market ордера: на столько хуже цены срабатывания (худшая допустимая цена исполнения).
-stop_market_slippage_bps = "500"
-# Каждый ордер подтверждается оператором вручную (этапы 6–8, решение без testnet).
-require_manual_confirmation = true
-
-[risk]
-# Нереализованный PnL открытой позиции входит в дневной/недельный убыток (консервативно, §12.3).
-loss_includes_unrealized = true
-# Предупреждение, когда у адреса остаётся мало запросов (address-based rate limit).
-address_requests_warning = 1000
-
-[dead_mans_switch]
-# scheduleCancel отменяет ВСЕ открытые ордера, а у нас единственные стоящие ордера — защитные
-# стопы (входы — IOC). Включённый switch при падении бота снял бы защиту с позиции, поэтому
-# по умолчанию выключен. Имеет смысл, только если появятся лимитные входы (GTC/ALO).
-enabled = false
-horizon_seconds = 120
-refresh_seconds = 30
-
-[target]
-# Разметка обучающего набора (docs/spec.md §8). Горизонт — market.horizon_candles.
-# UP: доходность за горизонт > порога; DOWN: < -порога; иначе FLAT.
-# Порог = издержки туда-обратно + запас + минимальный край.
-taker_fee_bps = "4.5"          # taker-комиссия базового уровня, за сторону
-expected_spread_bps = "1"      # спред BTC, один раз за сделку
-expected_slippage_bps = "2"    # за сторону (лимит — limits.max_slippage_bps)
-expected_funding_bps = "0.5"   # ~0.00125%/ч × 4 ч
-safety_margin_bps = "5"
-min_edge_bps = "20"
-
-[signal]
-# Торговая политика поверх вероятностей модели (docs/spec.md §7). Иначе — HOLD.
-min_probability = "0.45"   # p(UP) для BUY / p(DOWN) для SELL не ниже
-min_margin = "0.15"        # p(UP) − p(DOWN) для BUY (и наоборот для SELL) не ниже
-# Ожидаемая доходность E[r] = Σ p(класс) × средняя доходность класса на train
-# должна превышать target.cost_bps + target.safety_margin_bps.
-
-[live]
-# Требования перед живой торговлей (этап 14, docs/runbook.md). Проверяет `eratrade live-check`,
-# активация модели без этих доказательств из shadow запрещена.
-min_shadow_outcomes = 50          # сигналов модели с наступившим горизонтом
-max_shadow_error_rate = "0.05"    # доля HOLD из-за ошибок данных/модели
-min_shadow_coverage = "0.95"      # доля закрытых свечей с сигналом
-require_beats_baseline = true     # log loss по результатам shadow лучше априорного
-max_backup_age_hours = 26
-max_restore_check_age_days = 7
-min_wallet_valid_days = 14
-
-[auto]
-# Автоматическое исполнение без подтверждения (этап 15, §17.3, docs/runbook.md §8).
-# Включается только явно: enabled = true И execution.require_manual_confirmation = false,
-# и только после ручного этапа. Иначе `eratrade trader --auto` не запустится.
-enabled = false
-min_manual_trades = 10       # закрытых сделок бота без замечаний разбора (eratrade trades)
-pause_on_warnings = true     # пауза при любом неисправленном расхождении сверки, не только critical

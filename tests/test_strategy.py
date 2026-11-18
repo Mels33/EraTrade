@@ -1,3 +1,5 @@
+"""Конфигурация config/strategy.toml: секция [mm] и проверки значений."""
+
 import tomllib
 from decimal import Decimal
 from pathlib import Path
@@ -11,48 +13,43 @@ from app.config.strategy import StrategyConfig, load_strategy
 CONFIG = Path(__file__).resolve().parents[1] / "config" / "strategy.toml"
 
 
-def raw() -> dict[str, Any]:
+def test_repository_config_is_minimal_capital_market_making() -> None:
+    mm = load_strategy(CONFIG).mm
+    assert mm.coins and len(mm.coins) <= 2
+    assert mm.order_usd >= 10  # биржевой минимум
+    assert mm.max_inventory_usd <= Decimal(25)
+    assert mm.daily_loss_usd <= Decimal(2)
+    assert mm.dms_refresh_seconds < mm.dms_horizon_seconds
+
+
+def _data() -> dict[str, Any]:
     with CONFIG.open("rb") as f:
         return tomllib.load(f)
 
 
-def test_repository_config_matches_spec() -> None:
-    s = load_strategy(CONFIG)
-    assert s.market.coin == "BTC"
-    assert s.market.interval == "1h"
-    assert s.market.horizon_candles == 4
-    assert s.policy.allow_reversal is False
-    assert s.policy.time_exit_candles == 8
-    assert s.sizing.fixed_risk_usdc == Decimal("10")
-    assert s.sizing.risk_fraction == Decimal("0.005")
-    assert s.limits.max_position_notional_usdc == Decimal("20")
-    assert s.limits.max_daily_loss_fraction == Decimal("0.02")
-    assert s.limits.max_trades_per_day == 4
-    assert s.freshness.max_ws_silence_seconds == 30
-
-
 @pytest.mark.parametrize(
-    ("section", "key", "value"),
+    ("field", "value"),
     [
-        ("policy", "allow_reversal", True),
-        ("market", "leverage", 5),  # больше max_leverage
-        ("market", "margin_mode", "cross"),
-        ("sizing", "risk_fraction", "0.5"),
-        ("sizing", "fixed_risk_usdc", "-1"),
-        ("limits", "max_weekly_loss_fraction", "0.01"),  # меньше дневного
-        ("limits", "max_position_notional_usdc", "5"),  # меньше мин. номинала ордера
-        ("limits", "unknown_limit", 1),
+        ("order_usd", 5),  # меньше биржевого минимума
+        ("max_inventory_usd", 8),  # меньше заявки
+        ("dms_refresh_seconds", 500),  # не раньше горизонта
+        ("flow_pull_imbalance", 1.5),
+        ("unknown_field", 1),
     ],
 )
-def test_invalid_config_rejected(section: str, key: str, value: object) -> None:
-    data = raw()
-    data[section][key] = value
+def test_invalid_mm_config_rejected(field: str, value: object) -> None:
+    data = _data()
+    data["mm"][field] = value
     with pytest.raises(ValidationError):
         StrategyConfig.model_validate(data)
 
 
 def test_unsupported_spec_version_rejected() -> None:
-    data = raw()
-    data["spec_version"] = 2
-    with pytest.raises(ValidationError, match="spec_version"):
+    data = _data()
+    data["spec_version"] = 1
+    with pytest.raises(ValidationError):
+        StrategyConfig.model_validate(data)
+    data = _data()
+    data["market"] = {"coin": "BTC"}  # старые секции больше не принимаются
+    with pytest.raises(ValidationError):
         StrategyConfig.model_validate(data)

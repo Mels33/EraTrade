@@ -4,11 +4,10 @@
 """
 
 import hmac
-import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any
@@ -21,22 +20,13 @@ from sqlalchemy import select, text
 
 from app.api.context import ApiContext
 from app.config.settings import MAINNET_CONFIRMATION_PHRASE, TradingMode
-from app.db.models import ApiRequestRecord, AuditLogRecord, FillRecord
+from app.db.models import ApiRequestRecord, AuditLogRecord
 from app.db.repositories import control
-from app.db.repositories import market as market_repo
-from app.db.repositories import models as models_repo
-from app.db.repositories import reconciliation as rec_repo
-from app.db.repositories import trading as trading_repo
+from app.db.repositories import mm as mm_repo
 from app.domain.control import Actor, ActorKind, TransitionError
-from app.execution import emergency
-from app.execution.engine import OrderPreview
 from app.execution.lock import AnotherTraderRunningError
-from app.integrations.hyperliquid.gateway import INTERVALS
-from app.live.evidence import shadow_evidence
-from app.market_data.collector import COMPONENT as COLLECTOR
 
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-BACKUPS_DIR = Path(os.environ.get("ERATRADE_BACKUPS_DIR", "backups"))
 API_ACTOR = Actor(ActorKind.OPERATOR, "api")
 
 
@@ -73,7 +63,6 @@ Operator = Annotated[Actor, Depends(require_operator)]
 
 class CommandBody(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
-    confirm: str | None = None  # для опасных команд — имя команды (CANCEL_ALL, FLATTEN, KILL)
 
 
 class ModeBody(CommandBody):
@@ -102,29 +91,69 @@ async def health_ready(ctx: Ctx) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+@read.get("/mm")
+async def mm_overview(ctx: Ctx, days: int = Query(7, ge=1, le=90)) -> dict[str, Any]:
+    """Маркет-мейкер: живое состояние (heartbeat), последние исполнения, итоги по дням."""
+    now = ctx.clock()
+    async with ctx.sm() as db:
+        beat = next((h for h in await control.get_heartbeats(db) if h.component == "mm"), None)
+        fills = await mm_repo.recent_fills(db, 50)
+        daily = await mm_repo.daily_summary(db, now - timedelta(days=days))
+        minutes = await mm_repo.pnl_by_minute(db, now - timedelta(days=days))
+    curve, total = [], Decimal(0)
+    for t, net in minutes:
+        total += net
+        curve.append({"t": _t(t), "pnl": str(total)})
+    return {
+        "curve": curve,
+        "config": {
+            "coins": list(ctx.strategy.mm.coins),
+            "order_usd": str(ctx.strategy.mm.order_usd),
+            "max_inventory_usd": str(ctx.strategy.mm.max_inventory_usd),
+            "daily_loss_usd": str(ctx.strategy.mm.daily_loss_usd),
+        },
+        "live": (
+            {
+                "last_beat_age_s": round((now - beat.last_beat_at).total_seconds(), 1),
+                "started_at": _t(beat.started_at),
+                **beat.details,
+            }
+            if beat
+            else None
+        ),
+        "fills": [
+            {
+                "time": _t(f.time),
+                "coin": f.coin,
+                "side": f.side,
+                "price": str(f.price),
+                "size": str(f.size),
+                "notional": str((f.price * f.size).quantize(Decimal("0.01"))),
+                "fee": str(f.fee),
+                "closed_pnl": str(f.closed_pnl),
+                "crossed": f.crossed,
+            }
+            for f in fills
+        ],
+        "daily": [
+            {k: (str(v) if isinstance(v, Decimal) else v) for k, v in row.items()} for row in daily
+        ],
+    }
+
+
 @read.get("/status")
 async def status(ctx: Ctx) -> dict[str, Any]:
     now = ctx.clock()
-    step = INTERVALS[ctx.strategy.market.interval]
     async with ctx.sm() as db:
         state = await control.get_bot_state(db)
         heartbeats = await control.get_heartbeats(db)
-        _, _, last_closed = await market_repo.candle_stats(
-            db, ctx.market_id, ctx.strategy.market.interval
-        )
-        context = await market_repo.get_latest_context(db, ctx.market_id)
-        run = await rec_repo.latest_run(db, ctx.market_id, finished_only=True)
-        differences = await rec_repo.list_differences(db, run.id) if run else []
     return {
         "network": ctx.settings.network.value,
-        "coin": ctx.coin,
-        "interval": ctx.strategy.market.interval,
         "mode": state.trading_mode if state else TradingMode.DISABLED.value,
         "entries_blocked": state.entries_blocked if state else False,
         "block_reason": state.block_reason if state else None,
         "mode_updated_at": _t(state.updated_at) if state else None,
         "mode_updated_by": state.updated_by if state else None,
-        "trading_commands_available": ctx.engine_factory is not None,
         "components": [
             {
                 "component": hb.component,
@@ -133,169 +162,7 @@ async def status(ctx: Ctx) -> dict[str, Any]:
             }
             for hb in heartbeats
         ],
-        "data": {
-            "last_closed_candle": _t(last_closed),
-            "last_closed_age_min": (
-                round((now - (last_closed + step)).total_seconds() / 60, 1) if last_closed else None
-            ),
-            "context_age_s": (
-                round((now - context.received_at).total_seconds(), 1) if context else None
-            ),
-            "funding": _s(context.funding) if context else None,
-            "open_interest": _s(context.open_interest) if context else None,
-            "mark_price": _s(context.mark_price) if context else None,
-        },
-        "reconciliation": (
-            {
-                "run_id": run.id,
-                "status": run.status,
-                "trigger": run.trigger,
-                "finished_at": _t(run.finished_at),
-                "summary": run.summary,
-                "differences": [
-                    {
-                        "kind": d.kind,
-                        "severity": d.severity,
-                        "message": d.message,
-                        "repaired": d.repaired,
-                    }
-                    for d in differences
-                ],
-            }
-            if run
-            else None
-        ),
-        "collector_component": COLLECTOR,
     }
-
-
-async def _live(ctx: ApiContext) -> dict[str, Any]:
-    async def load() -> dict[str, Any]:
-        state = await ctx.gateway.get_account_state(ctx.user)
-        orders = [o for o in await ctx.gateway.get_open_orders(ctx.user) if o.coin == ctx.coin]
-        snap = await ctx.risk.snapshot()
-        limits = ctx.strategy.limits
-        position = state.position(ctx.coin)
-        return {
-            "exchange_time": _t(state.exchange_time),
-            "position": (
-                {
-                    "coin": position.coin,
-                    "size": _s(position.size),
-                    "entry_price": _s(position.entry_price),
-                    "unrealized_pnl": _s(position.unrealized_pnl),
-                    "liquidation_price": _s(position.liquidation_price),
-                    "margin_used": _s(position.margin_used),
-                    "leverage": f"{position.leverage_type} {position.leverage}x",
-                }
-                if position
-                else None
-            ),
-            "open_orders": [
-                {
-                    "oid": o.oid,
-                    "cloid": o.cloid,
-                    "side": o.side.value,
-                    "size": _s(o.size),
-                    "limit_price": _s(o.limit_price),
-                    "trigger_price": _s(o.trigger_price),
-                    "order_type": o.order_type,
-                    "reduce_only": o.reduce_only,
-                }
-                for o in orders
-            ],
-            "risk": {
-                "equity": _s(snap.equity),
-                "spot_usdc": _s(snap.spot_usdc),
-                "perp_account_value": _s(snap.perp_account_value),
-                "unrealized_pnl": _s(snap.unrealized_pnl),
-                "daily_pnl": _s(snap.daily_pnl),
-                "daily_limit": _s(snap.daily_base * limits.max_daily_loss_fraction),
-                "weekly_pnl": _s(snap.weekly_pnl),
-                "weekly_limit": _s(snap.weekly_base * limits.max_weekly_loss_fraction),
-                "realized_today": _s(snap.realized_today),
-                "fees_today": _s(snap.fees_today),
-                "funding_today": _s(snap.funding_today),
-                "trades_today": snap.trades_today,
-                "max_trades_per_day": limits.max_trades_per_day,
-                "blocks": ctx.risk.entry_blocks(snap),
-            },
-        }
-
-    result: dict[str, Any] = await ctx.cache.get("live", load)
-    return result
-
-
-@read.get("/account")
-async def account(ctx: Ctx) -> dict[str, Any]:
-    return await _live(ctx)
-
-
-@read.get("/positions")
-async def positions(ctx: Ctx) -> dict[str, Any]:
-    live = await _live(ctx)
-    return {"position": live["position"], "open_orders": live["open_orders"]}
-
-
-@read.get("/risk")
-async def risk(ctx: Ctx) -> dict[str, Any]:
-    return (await _live(ctx))["risk"]  # type: ignore[no-any-return]
-
-
-@read.get("/orders")
-async def orders(ctx: Ctx, limit: Annotated[int, Query(ge=1, le=500)] = 50) -> list[dict[str, Any]]:
-    async with ctx.sm() as db:
-        records = await trading_repo.list_orders(db, market_id=ctx.market_id, limit=limit)
-    return [
-        {
-            "id": str(o.id),
-            "cloid": o.cloid,
-            "oid": o.oid,
-            "purpose": o.purpose,
-            "kind": o.order_kind,
-            "side": o.side,
-            "size": _s(o.size),
-            "price": _s(o.price),
-            "trigger_price": _s(o.trigger_price),
-            "status": o.status,
-            "filled_size": _s(o.filled_size),
-            "avg_fill_price": _s(o.avg_fill_price),
-            "error": o.error,
-            "created_at": _t(o.created_at),
-        }
-        for o in records
-    ]
-
-
-@read.get("/fills")
-async def fills(ctx: Ctx, limit: Annotated[int, Query(ge=1, le=500)] = 50) -> list[dict[str, Any]]:
-    async with ctx.sm() as db:
-        stmt = (
-            select(FillRecord)
-            .where(FillRecord.market_id == ctx.market_id)
-            .order_by(FillRecord.time.desc())
-            .limit(limit)
-        )
-        records = list((await db.execute(stmt)).scalars())
-    return [
-        {
-            "tid": f.tid,
-            "time": _t(f.time),
-            "side": f.side,
-            "size": _s(f.size),
-            "price": _s(f.price),
-            "fee": _s(f.fee),
-            "closed_pnl": _s(f.closed_pnl),
-            "direction": f.direction,
-            "bot_order": f.order_id is not None,
-        }
-        for f in records
-    ]
-
-
-@read.get("/reconciliation")
-async def reconciliation(ctx: Ctx) -> dict[str, Any]:
-    return {"latest": (await status(ctx))["reconciliation"]}
 
 
 @read.get("/audit")
@@ -314,146 +181,6 @@ async def audit(ctx: Ctx, limit: Annotated[int, Query(ge=1, le=500)] = 50) -> li
         }
         for a in records
     ]
-
-
-@read.get("/signals")
-async def signals(ctx: Ctx, limit: Annotated[int, Query(ge=1, le=500)] = 50) -> dict[str, Any]:
-    async with ctx.sm() as db:
-        records = await models_repo.list_signals(db, limit=limit)
-    return {
-        "items": [
-            {
-                "id": r.id,
-                "decision_time": _t(r.decision_time),
-                "model_version": r.model_version,
-                "model_role": r.model_role,
-                "policy_version": r.policy_version,
-                "decision": r.decision,
-                "reason": r.reason,
-                "probabilities": r.probabilities,
-                "expected_return_bps": r.expected_return_bps,
-                "position_side": r.position_side,
-                "outcome_return": r.outcome_return,
-                "outcome_label": r.outcome_label,
-            }
-            for r in records
-        ]
-    }
-
-
-@read.get("/shadow/report")
-async def shadow_report_endpoint(
-    ctx: Ctx, days: Annotated[float, Query(gt=0, le=90)] = 7
-) -> dict[str, Any]:
-    from datetime import timedelta
-
-    from app.signals.report import shadow_report
-
-    now = ctx.clock()
-    async with ctx.sm() as db:
-        report = await shadow_report(
-            db,
-            ctx.market_id,
-            since=now - timedelta(days=days),
-            now=now,
-            step=INTERVALS[ctx.strategy.market.interval],
-            cost_bps=float(ctx.strategy.target.cost_bps),
-        )
-    # порог результатов для активации (полоса прогресса в панели)
-    report["live_min_outcomes"] = ctx.strategy.live.min_shadow_outcomes
-    report["min_probability"] = float(ctx.strategy.signal.min_probability)
-    return report
-
-
-@read.get("/candles")
-async def candles(
-    ctx: Ctx, hours: Annotated[int, Query(ge=2, le=24 * 14)] = 48
-) -> list[dict[str, Any]]:
-    """Закрытые свечи за последние hours часов (для графика цены)."""
-    from datetime import timedelta
-
-    async with ctx.sm() as db:
-        records = await market_repo.get_candles(
-            db,
-            ctx.market_id,
-            ctx.strategy.market.interval,
-            start=ctx.clock() - timedelta(hours=hours),
-        )
-    return [
-        {
-            "open_time": _t(c.open_time),
-            "open": _s(c.open),
-            "high": _s(c.high),
-            "low": _s(c.low),
-            "close": _s(c.close),
-            "volume": _s(c.volume),
-        }
-        for c in records
-    ]
-
-
-@read.get("/live/readiness")
-async def live_readiness(ctx: Ctx) -> dict[str, Any]:
-    from app.live.readiness import readiness, summary
-
-    checks = await ctx.cache.get(
-        "readiness",
-        lambda: readiness(
-            ctx.settings,
-            ctx.strategy,
-            ctx.sm,
-            ctx.gateway,
-            market_id=ctx.market_id,
-            backups_dir=BACKUPS_DIR,
-            now=ctx.clock(),
-        ),
-    )
-    return {
-        "summary": summary(checks).value,
-        "checks": [{"name": c.name, "status": c.status.value, "detail": c.detail} for c in checks],
-    }
-
-
-@read.get("/trades")
-async def trades(ctx: Ctx, limit: Annotated[int, Query(ge=1, le=200)] = 20) -> list[dict[str, Any]]:
-    from app.live.review import round_trips
-
-    async with ctx.sm() as db:
-        result = await round_trips(db, ctx.market_id, ctx.strategy)
-    return [t.as_dict() for t in result[-limit:]][::-1]
-
-
-def _test_metrics(artifact: dict[str, Any]) -> dict[str, Any]:
-    test = artifact.get("metrics", {}).get("test", {})
-    return {
-        "log_loss": test.get("log_loss"),
-        "baseline_log_loss": test.get("baseline_log_loss"),
-        "brier": test.get("brier"),
-        "ece": test.get("ece"),
-        "policy": test.get("policy"),
-    }
-
-
-@read.get("/models")
-async def models(ctx: Ctx) -> dict[str, Any]:
-    async with ctx.sm() as db:
-        records = await models_repo.list_models(db)
-    return {
-        "items": [
-            {
-                "version": r.version,
-                "status": r.status,
-                "feature_set_version": r.feature_set_version,
-                "created_at": _t(r.created_at),
-                "shadow_at": _t(r.shadow_at),
-                "activated_at": _t(r.activated_at),
-                "retired_at": _t(r.retired_at),
-                "training_period": r.artifact.get("training_period"),
-                "test": _test_metrics(r.artifact),
-            }
-            for r in records
-        ]
-    }
 
 
 # --- управление ---
@@ -499,23 +226,7 @@ async def _idempotent(
             record.status_code = status_code
             record.response = body
             record.finished_at = ctx.clock()
-    ctx.cache.clear()
     return JSONResponse(body, status_code=status_code)
-
-
-def _require_confirm(body: CommandBody, command: str) -> None:
-    if body.confirm != command:
-        raise HTTPException(status_code=422, detail=f"подтвердите команду: confirm = {command}")
-
-
-def _engine(ctx: ApiContext) -> Callable[[], AbstractAsyncContextManager[Any]]:
-    if ctx.engine_factory is None:
-        raise HTTPException(status_code=503, detail="ключ API-кошелька не подключён к API")
-    return ctx.engine_factory
-
-
-async def _yes(preview: OrderPreview) -> bool:
-    return True  # подтверждение — сам запрос оператора с confirm=<команда>
 
 
 IdemKey = Annotated[str | None, Header(alias="Idempotency-Key")]
@@ -526,9 +237,9 @@ async def bot_pause(
     body: CommandBody, ctx: Ctx, actor: Operator, key: IdemKey = None
 ) -> JSONResponse:
     async def run() -> dict[str, Any]:
-        steps = await emergency.pause(
-            ctx.sm, ctx.settings.network, actor=actor, reason=body.reason, notifier=ctx.notifier
-        )
+        async with ctx.sm.begin() as db:
+            steps = await control.pause(db, ctx.settings.network, actor=actor, reason=body.reason)
+        await ctx.notifier.send(f"PAUSE ({actor}): {body.reason}")
         return {"steps": steps}
 
     return await _idempotent(ctx, key, "pause", actor, run)
@@ -546,6 +257,58 @@ async def bot_resume(
         return {"steps": ["запрет входов снят" if changed else "запрета не было"]}
 
     return await _idempotent(ctx, key, "resume", actor, run)
+
+
+class StartBody(CommandBody):
+    confirmation_phrase: str
+
+
+@control_router.post("/bot/start")
+async def bot_start(
+    body: StartBody, ctx: Ctx, actor: Operator, key: IdemKey = None
+) -> JSONResponse:
+    """Запустить торговлю: снять запрет входов и включить LIVE_ENABLED (нужна фраза mainnet)."""
+
+    async def run() -> dict[str, Any]:
+        if body.confirmation_phrase != MAINNET_CONFIRMATION_PHRASE:
+            raise HTTPException(
+                status_code=422, detail=f"введите фразу {MAINNET_CONFIRMATION_PHRASE}"
+            )
+        steps = []
+        async with ctx.sm.begin() as db:
+            if await control.unblock_entries(
+                db, ctx.settings.network, actor=actor, reason=body.reason
+            ):
+                steps.append("запрет входов снят")
+            if await control.set_trading_mode(
+                db, ctx.settings.network, TradingMode.LIVE_ENABLED, actor=actor, reason=body.reason
+            ):
+                steps.append("режим LIVE_ENABLED")
+        await ctx.notifier.send(f"START ({actor}): {body.reason}")
+        return {"steps": steps or ["уже запущен"]}
+
+    return await _idempotent(ctx, key, "start", actor, run)
+
+
+@control_router.post("/bot/stop")
+async def bot_stop(
+    body: CommandBody, ctx: Ctx, actor: Operator, key: IdemKey = None
+) -> JSONResponse:
+    """Выключить: режим DISABLED. Маркет-мейкер снимает заявки и закрывает позиции своих монет."""
+
+    async def run() -> dict[str, Any]:
+        async with ctx.sm.begin() as db:
+            changed = await control.set_trading_mode(
+                db, ctx.settings.network, TradingMode.DISABLED, actor=actor, reason=body.reason
+            )
+        await ctx.notifier.send(f"STOP ({actor}): {body.reason}")
+        return {
+            "steps": ["режим DISABLED: заявки снимаются, позиции закрываются"]
+            if changed
+            else ["уже выключен"]
+        }
+
+    return await _idempotent(ctx, key, "stop", actor, run)
 
 
 @control_router.post("/bot/mode")
@@ -566,79 +329,6 @@ async def bot_mode(body: ModeBody, ctx: Ctx, actor: Operator, key: IdemKey = Non
         return {"steps": [f"режим {body.mode.value}" if changed else "режим не изменился"]}
 
     return await _idempotent(ctx, key, f"mode:{body.mode.value}", actor, run)
-
-
-def _emergency_body(result: emergency.EmergencyResult) -> dict[str, Any]:
-    return {"steps": result.steps, "warnings": result.warnings}
-
-
-@control_router.post("/bot/cancel-all")
-async def bot_cancel_all(
-    body: CommandBody, ctx: Ctx, actor: Operator, key: IdemKey = None
-) -> JSONResponse:
-    async def run() -> dict[str, Any]:
-        _require_confirm(body, "CANCEL_ALL")
-        async with _engine(ctx)() as engine:
-            return _emergency_body(
-                await emergency.cancel_all(engine, actor=actor, reason=body.reason)
-            )
-
-    return await _idempotent(ctx, key, "cancel-all", actor, run)
-
-
-@control_router.post("/bot/flatten")
-async def bot_flatten(
-    body: CommandBody, ctx: Ctx, actor: Operator, key: IdemKey = None
-) -> JSONResponse:
-    async def run() -> dict[str, Any]:
-        _require_confirm(body, "FLATTEN")
-        async with _engine(ctx)() as engine:
-            return _emergency_body(await emergency.flatten(engine, confirm=_yes))
-
-    return await _idempotent(ctx, key, "flatten", actor, run)
-
-
-@control_router.post("/bot/kill-switch")
-async def bot_kill(
-    body: CommandBody, ctx: Ctx, actor: Operator, key: IdemKey = None
-) -> JSONResponse:
-    async def run() -> dict[str, Any]:
-        _require_confirm(body, "KILL")
-        async with _engine(ctx)() as engine:
-            return _emergency_body(
-                await emergency.full_kill(engine, actor=actor, reason=body.reason, confirm=_yes)
-            )
-
-    return await _idempotent(ctx, key, "kill-switch", actor, run)
-
-
-@control_router.post("/models/{version}/activate")
-async def activate_model(
-    version: str, body: CommandBody, ctx: Ctx, actor: Operator, key: IdemKey = None
-) -> JSONResponse:
-    async def run() -> dict[str, Any]:
-        _require_confirm(body, "ACTIVATE")
-        async with ctx.sm.begin() as db:
-            current = await models_repo.get_model(db, version)
-            rollback = current.status == "retired" and current.activated_at is not None
-            if not rollback:
-                evidence = await shadow_evidence(
-                    db,
-                    current,
-                    ctx.strategy.live,
-                    now=ctx.clock(),
-                    step=INTERVALS[ctx.strategy.market.interval],
-                    cost_bps=float(ctx.strategy.target.cost_bps),
-                )
-                if not evidence.ok:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="доказательств shadow недостаточно: " + "; ".join(evidence.failures),
-                    )
-            record = await models_repo.activate(db, version, actor=actor, reason=body.reason)
-        return {"steps": [f"{record.version}: {record.status}"]}
-
-    return await _idempotent(ctx, key, f"model-activate:{version}", actor, run)
 
 
 def create_api(

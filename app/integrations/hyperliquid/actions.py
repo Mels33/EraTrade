@@ -103,6 +103,34 @@ def cancel_by_cloid_action(asset: int, cloid: str) -> dict[str, Any]:
     return {"type": "cancelByCloid", "cancels": [{"asset": asset, "cloid": validate_cloid(cloid)}]}
 
 
+def cancel_many_action(cancels: list[tuple[int, int]]) -> dict[str, Any]:
+    """Пакетная отмена по oid: [(asset, oid), ...]."""
+    if not cancels:
+        raise ValueError("пустой список отмен")
+    return {"type": "cancel", "cancels": [{"a": a, "o": o} for a, o in cancels]}
+
+
+def cancel_by_cloid_many_action(cancels: list[tuple[int, str]]) -> dict[str, Any]:
+    if not cancels:
+        raise ValueError("пустой список отмен")
+    return {
+        "type": "cancelByCloid",
+        "cancels": [{"asset": a, "cloid": validate_cloid(c)} for a, c in cancels],
+    }
+
+
+def batch_modify_action(modifies: list[tuple[int | str, OrderRequest]]) -> dict[str, Any]:
+    """Перестановка ордеров: [(oid или cloid старого ордера, новый ордер), ...] (формат SDK)."""
+    if not modifies:
+        raise ValueError("пустой список перестановок")
+    wires = []
+    for target, order in modifies:
+        if isinstance(target, str):
+            validate_cloid(target)
+        wires.append({"oid": target, "order": order.to_wire()})
+    return {"type": "batchModify", "modifies": wires}
+
+
 def update_leverage_action(asset: int, *, is_cross: bool, leverage: int) -> dict[str, Any]:
     if leverage < 1:
         raise ValueError("плечо должно быть >= 1")
@@ -119,5 +147,5 @@ def schedule_cancel_action(time_ms: int | None) -> dict[str, Any]:
 
 def action_weight(action: dict[str, Any]) -> int:
     """Вес для IP-лимита: 1 + floor(batch_length / 40)."""
-    batch = action.get("orders") or action.get("cancels") or []
+    batch = action.get("orders") or action.get("cancels") or action.get("modifies") or []
     return 1 + len(batch) // 40

@@ -200,3 +200,17 @@ async def beat(
 async def get_heartbeats(session: AsyncSession) -> list[HeartbeatRecord]:
     stmt = select(HeartbeatRecord).order_by(HeartbeatRecord.component)
     return list((await session.execute(stmt)).scalars())
+
+
+async def pause(session: AsyncSession, network: Network, *, actor: Actor, reason: str) -> list[str]:
+    """Пауза: запрет новых входов и LIVE_ENABLED → LIVE_PAUSED (маркет-мейкер снимает заявки)."""
+    steps = []
+    if await block_entries(session, network, actor=actor, reason=f"PAUSE: {reason}"):
+        steps.append("новые входы запрещены")
+    state = await ensure_bot_state(session, network)
+    if state.trading_mode == TradingMode.LIVE_ENABLED.value:
+        await set_trading_mode(
+            session, network, TradingMode.LIVE_PAUSED, actor=actor, reason=f"PAUSE: {reason}"
+        )
+        steps.append("режим LIVE_ENABLED → LIVE_PAUSED")
+    return steps or ["уже на паузе"]

@@ -20,76 +20,12 @@ services:
       timeout: 3s
       retries: 20
 
-  # Коллектор рыночных данных mainnet: только чтение публичных данных, режим DISABLED, без ключей.
-  # Запуск: docker-compose --profile collector up -d --build
-  collector-mainnet:
+  # Маркет-мейкер (живые заявки, нужен ключ). Котирует только в режиме LIVE_ENABLED;
+  # пауза/kill из панели снимают котировки. Без автоперезапуска: падение = ошибка, а заявки
+  # биржа снимет сама по scheduleCancel. Запуск: scripts/eratrade.sh mm-start.
+  mm-mainnet:
     build: .
-    container_name: eratrade-collector-mainnet
-    profiles: ["collector"]
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file: .env.mainnet
-    environment:
-      DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
-      ERATRADE_ENV_FILE: /nonexistent
-    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade collect"]
-    stop_grace_period: 15s
-    logging:
-      driver: json-file
-      options: {max-size: "20m", max-file: "5"}
-
-  # Периодическая сверка с биржей (§11 плана): раз в минуту. Ключ API-кошелька не нужен —
-  # только чтение биржи; критичное расхождение блокирует входы и ставит LIVE_PAUSED.
-  reconciler-mainnet:
-    build: .
-    container_name: eratrade-reconciler-mainnet
-    profiles: ["collector"]
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file: .env.mainnet
-    environment:
-      DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
-      ERATRADE_ENV_FILE: /nonexistent
-    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade reconcile --every 60"]
-    stop_grace_period: 15s
-    logging:
-      driver: json-file
-      options: {max-size: "20m", max-file: "5"}
-
-  # Mainnet shadow (§16.4): сигналы на каждую закрытую свечу без ключа API-кошелька.
-  # Артефакты моделей — из ./models (только чтение).
-  shadow-mainnet:
-    build: .
-    container_name: eratrade-shadow-mainnet
-    profiles: ["collector"]
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file: .env.mainnet
-    environment:
-      DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
-      ERATRADE_ENV_FILE: /nonexistent
-      MODELS_DIR: /app/models
-    volumes:
-      - ./models:/app/models:ro
-    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade shadow"]
-    stop_grace_period: 15s
-    logging:
-      driver: json-file
-      options: {max-size: "20m", max-file: "5"}
-
-  # Автоматическое исполнение (этап 15, docs/runbook.md §8). Отдельный профиль `live` —
-  # не запускается вместе с остальными сервисами. restart: "no" — после падения торговля сама
-  # не возобновляется; при старте LIVE_ENABLED понижается до LIVE_PAUSED, включает оператор.
-  # Процесс сам откажется работать, если не пройден барьер [auto] в config/strategy.toml.
-  trader-mainnet:
-    build: .
-    container_name: eratrade-trader-mainnet
+    container_name: eratrade-mm-mainnet
     profiles: ["live"]
     restart: "no"
     depends_on:
@@ -99,11 +35,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
       ERATRADE_ENV_FILE: /nonexistent
-      MODELS_DIR: /app/models
-    volumes:
-      - ./models:/app/models:ro
-      - ./backups:/backups:ro
-    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade trader --auto --backups /backups"]
+    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade mm --yes"]
     stop_grace_period: 30s
     logging:
       driver: json-file
@@ -114,7 +46,7 @@ services:
   api-mainnet:
     build: .
     container_name: eratrade-api-mainnet
-    profiles: ["collector"]
+    profiles: ["core"]
     restart: unless-stopped
     depends_on:
       postgres:
@@ -123,9 +55,6 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
       ERATRADE_ENV_FILE: /nonexistent
-      ERATRADE_BACKUPS_DIR: /backups
-    volumes:
-      - ./backups:/backups:ro  # для проверки готовности (возраст бэкапа и проверки восстановления)
     ports:
       - "127.0.0.1:8000:8000"
     entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade api --host 0.0.0.0 --allow-external"]
@@ -138,7 +67,7 @@ services:
   pg-backup:
     image: postgres:17
     container_name: eratrade-pg-backup
-    profiles: ["collector"]
+    profiles: ["core"]
     restart: unless-stopped
     user: "1000:1000"  # файлы бэкапов принадлежат пользователю, а не root
     depends_on:

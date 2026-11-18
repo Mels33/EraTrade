@@ -69,13 +69,21 @@ export function agoIso(iso: string | null | undefined, now = Date.now()): string
   return ago((now - new Date(iso).getTime()) / 1000);
 }
 
-export function countdown(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  return `${pad(Math.floor(total / 60))}:${pad(total % 60)}`;
+/** Длительность: «1 ч 12 мин», «5 мин», «40 с». */
+export function duration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  if (seconds < 60) return `${Math.round(seconds)} с`;
+  const m = Math.floor(seconds / 60);
+  if (m < 60) return `${m} мин`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} ч ${m % 60} мин`;
+  return `${Math.floor(h / 24)} дн ${h % 24} ч`;
 }
 
-/** Следующий проход торгового цикла/наблюдения: граница часа + 5 с. */
-export function nextDecision(now = Date.now()): number {
-  const hour = 3_600_000;
-  return Math.floor(now / hour) * hour + hour + 5_000;
+/** Цена с нужной точностью: мелкие монеты — до 6 знаков. */
+export function px(v: string | number | null | undefined): string {
+  const n = num(v);
+  if (!Number.isFinite(n)) return "—";
+  const digits = n >= 1000 ? 1 : n >= 10 ? 3 : n >= 1 ? 4 : 6;
+  return n.toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: digits });
 }

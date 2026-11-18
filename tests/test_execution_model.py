@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.models.execution_model import Costs, simulate
+from app.research.execution_model import Costs, simulate
 
 C = Costs()
 

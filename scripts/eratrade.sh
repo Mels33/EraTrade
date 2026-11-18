@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # Управление EraTrade одной командой.
 #
-#   scripts/eratrade.sh up        — БД + API с панелью + коллектор + сверка + бэкапы (Docker)
+#   scripts/eratrade.sh up        — БД + API с панелью + бэкапы (Docker)
 #   scripts/eratrade.sh down      — остановить всё (данные БД сохраняются в volume)
 #   scripts/eratrade.sh restart   — пересобрать и перезапустить
 #   scripts/eratrade.sh status    — контейнеры и сводка состояния бота
 #   scripts/eratrade.sh logs [сервис]  — логи (по умолчанию всех сервисов)
 #   scripts/eratrade.sh dev       — разработка: БД в Docker, API и панель локально с перезагрузкой
-#   scripts/eratrade.sh auto-start — этап 15: автоматический trader в Docker (после барьера [auto])
-#   scripts/eratrade.sh auto-stop  — остановить автоматический trader (позиция и стоп остаются)
+#   scripts/eratrade.sh mm-start  — маркет-мейкер с живыми заявками (котирует в режиме LIVE_ENABLED)
+#   scripts/eratrade.sh mm-stop   — остановить маркет-мейкер (заявки снимаются, позиция остаётся)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-PROFILE="collector"
+PROFILE="core"
 API_URL="http://127.0.0.1:8000"
 DEV_URL="http://127.0.0.1:5173"
 ENV_MAIN=".env.mainnet"
@@ -98,14 +98,12 @@ d = json.loads(sys.argv[1])
 blocked = f"ЗАПРЕЩЕНЫ ({d['block_reason']})" if d["entries_blocked"] else "разрешены режимом"
 print(f"  Сеть: {d['network'].upper()} · режим {d['mode']} · входы {blocked}")
 for c in d["components"]:
-    state = c["details"].get("ws_state") or c["details"].get("status") or ""
-    ok = "ok " if c["last_beat_age_s"] < 120 else "НЕТ"
-    print(f"  [{ok}] {c['component']:<11} heartbeat {c['last_beat_age_s']:.0f} с назад {state}")
-data = d["data"]
-print(f"  Свечи: последняя закрытая {data['last_closed_candle']} ({data['last_closed_age_min']} мин)")
-rec = d["reconciliation"]
-if rec:
-    print(f"  Сверка #{rec['run_id']}: {rec['status']} ({rec['finished_at']})")
+    state = c["details"].get("state") or ""
+    ok = "ok " if c["last_beat_age_s"] < 60 else "НЕТ"
+    print(f"  [{ok}] {c['component']:<6} heartbeat {c['last_beat_age_s']:.0f} с назад  {state}")
+    if c["component"] == "mm":
+        det = c["details"]
+        print(f"         результат за сутки {det.get('pnl_today')} USDC, баланс {det.get('spot_usdc')} USDC")
 EOF
 }
 
@@ -126,9 +124,8 @@ cmd_up() {
 
 cmd_down() {
   bold "Остановка EraTrade"
-  echo "Внимание: коллектор перестанет собирать данные, сверка — проверять аккаунт."
-  # Автоматический trader (профиль live) останавливаем первым и сам он не вернётся.
-  "${COMPOSE[@]}" --profile live stop trader-mainnet >/dev/null 2>&1 || true
+  echo "Маркет-мейкер снимет заявки; позиция (если есть) останется."
+  "${COMPOSE[@]}" --profile live stop mm-mainnet >/dev/null 2>&1 || true
   compose down
   green "Остановлено. Данные БД сохранены (volume eratrade_pg_data)."
 }
@@ -172,25 +169,18 @@ cmd_dev() {
   wait
 }
 
-cmd_auto_start() {
+cmd_mm_start() {
   check_env
-  red "АВТОМАТИЧЕСКОЕ ИСПОЛНЕНИЕ на MAINNET: ордера без подтверждения (docs/runbook.md §8)"
-  read -r -p "Введите AUTO для запуска: " answer
-  [[ "$answer" == "AUTO" ]] || { echo "Отменено"; exit 1; }
-  "${COMPOSE[@]}" --profile live up -d --build trader-mainnet
-  sleep 15
-  if [[ "$(docker inspect -f '{{.State.Running}}' eratrade-trader-mainnet 2>/dev/null)" != "true" ]]; then
-    red "trader не запущен — барьер не пройден или ошибка:"
-    docker logs --tail 30 eratrade-trader-mainnet
-    exit 1
-  fi
-  green "trader запущен. Торговля начнётся только в режиме LIVE_ENABLED (eratrade set-mode)."
-  docker logs --tail 10 eratrade-trader-mainnet
+  bold "Маркет-мейкер: живые заявки"
+  "${COMPOSE[@]}" --profile live up -d --build mm-mainnet
+  echo "Котирует только в режиме «Торгует» (панель → Управление → «Запустить торговлю»)."
+  echo "Логи: scripts/eratrade.sh logs mm-mainnet"
 }
 
-cmd_auto_stop() {
-  "${COMPOSE[@]}" --profile live stop trader-mainnet
-  green "trader остановлен. Открытая позиция защищена стопом на бирже; закрыть: eratrade flatten"
+cmd_mm_stop() {
+  bold "Остановка маркет-мейкера"
+  "${COMPOSE[@]}" --profile live stop mm-mainnet
+  green "Остановлен: заявки сняты. Позицию (если есть) закрыть в панели или вручную."
 }
 
 case "${1:-}" in
@@ -200,8 +190,8 @@ case "${1:-}" in
   status) cmd_status ;;
   logs) shift; cmd_logs "$@" ;;
   dev) cmd_dev ;;
-  auto-start) cmd_auto_start ;;
-  auto-stop) cmd_auto_stop ;;
+  mm-start) cmd_mm_start ;;
+  mm-stop) cmd_mm_stop ;;
   *)
     sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit 1

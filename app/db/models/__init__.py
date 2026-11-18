@@ -1,7 +1,4 @@
-"""ORM-модели. Импорт этого пакета регистрирует все таблицы в Base.metadata (нужно Alembic).
-
-Таблицы добавляются по этапам, см. §6.6 плана.
-"""
+"""ORM-модели. Импорт этого пакета регистрирует все таблицы в Base.metadata (нужно Alembic)."""
 
 from app.db.models.api import ApiRequestRecord
 from app.db.models.control import (
@@ -10,53 +7,13 @@ from app.db.models.control import (
     HeartbeatRecord,
     NonceStateRecord,
 )
-from app.db.models.market import (
-    BookStatsRecord,
-    CandleRecord,
-    FundingHistoryRecord,
-    MarketContextSnapshotRecord,
-    MarketRecord,
-    TradeFlowRecord,
-)
-from app.db.models.models import FeatureSnapshotRecord, ModelVersionRecord, SignalRecord
-from app.db.models.reconciliation import (
-    FundingEventRecord,
-    LedgerEventRecord,
-    PositionBaselineRecord,
-    ReconciliationDifferenceRecord,
-    ReconciliationRunRecord,
-)
-from app.db.models.trading import (
-    AccountSnapshotRecord,
-    FillRecord,
-    OrderEventRecord,
-    OrderRecord,
-    PositionSnapshotRecord,
-)
+from app.db.models.mm import MmFillRecord
 
 __all__ = [
-    "AccountSnapshotRecord",
     "ApiRequestRecord",
     "AuditLogRecord",
-    "BookStatsRecord",
     "BotStateRecord",
-    "CandleRecord",
-    "FeatureSnapshotRecord",
-    "FillRecord",
-    "FundingEventRecord",
-    "FundingHistoryRecord",
     "HeartbeatRecord",
-    "LedgerEventRecord",
-    "MarketContextSnapshotRecord",
-    "MarketRecord",
-    "ModelVersionRecord",
+    "MmFillRecord",
     "NonceStateRecord",
-    "OrderEventRecord",
-    "OrderRecord",
-    "PositionBaselineRecord",
-    "PositionSnapshotRecord",
-    "ReconciliationDifferenceRecord",
-    "ReconciliationRunRecord",
-    "SignalRecord",
-    "TradeFlowRecord",
 ]

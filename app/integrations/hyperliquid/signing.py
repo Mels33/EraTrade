@@ -12,7 +12,7 @@ from hyperliquid.utils.signing import sign_l1_action
 from pydantic import SecretStr
 
 ALLOWED_ACTIONS = frozenset(
-    {"order", "cancel", "cancelByCloid", "updateLeverage", "scheduleCancel"}
+    {"order", "cancel", "cancelByCloid", "batchModify", "updateLeverage", "scheduleCancel"}
 )
 
 

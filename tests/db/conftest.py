@@ -93,11 +93,7 @@ async def committing_sessionmaker(
     Данные реально коммитятся; рыночные таблицы очищаются до и после теста
     (audit_log не трогается — его очистка запрещена триггером)."""
     engine = create_async_engine(migrated_db, poolclass=NullPool)
-    truncate = text(
-        "TRUNCATE candles, market_context_snapshots, heartbeats, markets, nonce_state, "
-        "bot_state, account_snapshots, funding_events, ledger_events, signals, "
-        "feature_snapshots, model_versions, trade_flow, book_stats CASCADE"
-    )
+    truncate = text("TRUNCATE heartbeats, nonce_state, bot_state, mm_fills, api_requests CASCADE")
     async with engine.begin() as conn:
         await conn.execute(truncate)
     try:
@@ -106,7 +102,3 @@ async def committing_sessionmaker(
         async with engine.begin() as conn:
             await conn.execute(truncate)
         await engine.dispose()
-
-
-# Общее окружение торговых тестов (симулятор биржи + движок): регистрируем фикстуру `env`.
-from tests.db.trading_env import env  # noqa: E402, F401
