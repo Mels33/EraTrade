@@ -99,3 +99,15 @@ async def pnl_by_minute(session: AsyncSession, since: datetime) -> list[tuple[da
         .order_by(minute)
     )
     return [(t, Decimal(v)) for t, v in (await session.execute(stmt)).all()]
+
+
+async def last_buy_price(session: AsyncSession, coin: str) -> Decimal | None:
+    """Цена последней покупки по монете (восстановление уровня после перезапуска)."""
+    stmt = (
+        select(MmFillRecord.price)
+        .where(MmFillRecord.coin == coin, MmFillRecord.side == "buy")
+        .order_by(MmFillRecord.time.desc(), MmFillRecord.tid.desc())
+        .limit(1)
+    )
+    value = (await session.execute(stmt)).scalar_one_or_none()
+    return Decimal(value) if value is not None else None

@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 
 BASE = "https://data.binance.vision/data/futures/um/daily"
+MONTHLY = "https://data.binance.vision/data/futures/um/monthly"
 SYMBOL = "BTCUSDT"
 KINDS = ("aggTrades", "bookDepth")
 
@@ -44,14 +45,36 @@ def download(
 ) -> Path | None:
     """Скачивает и проверяет дневной файл. None — файла нет в архиве."""
     target = raw_dir / kind / file_name(kind, day, symbol)
+    return _fetch(client, url(kind, day, symbol), target)
+
+
+def klines_month(
+    client: httpx.Client, symbol: str, month: str, raw_dir: Path, interval: str = "1m"
+) -> Path | None:
+    """Месячный файл минутных свечей USDⓈ-M futures (month = 'YYYY-MM'). None — нет в архиве."""
+    name = f"{symbol}-{interval}-{month}.zip"
+    target = raw_dir / "klines" / symbol / name
+    return _fetch(client, f"{MONTHLY}/klines/{symbol}/{interval}/{name}", target)
+
+
+def klines_day(
+    client: httpx.Client, symbol: str, day: date, raw_dir: Path, interval: str = "1m"
+) -> Path | None:
+    """Дневной файл минутных свечей (для текущего, ещё не закрытого месяца)."""
+    name = f"{symbol}-{interval}-{day.isoformat()}.zip"
+    target = raw_dir / "klines" / symbol / name
+    return _fetch(client, f"{BASE}/klines/{symbol}/{interval}/{name}", target)
+
+
+def _fetch(client: httpx.Client, file_url: str, target: Path) -> Path | None:
     if target.exists():
         return target
-    checksum = client.get(url(kind, day, symbol) + ".CHECKSUM")
+    checksum = client.get(file_url + ".CHECKSUM")
     if checksum.status_code == 404:
         return None
     checksum.raise_for_status()
     expected = parse_checksum(checksum.text)
-    response = client.get(url(kind, day, symbol))
+    response = client.get(file_url)
     if response.status_code == 404:
         return None
     response.raise_for_status()

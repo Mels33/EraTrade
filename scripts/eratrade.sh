@@ -7,8 +7,9 @@
 #   scripts/eratrade.sh status    — контейнеры и сводка состояния бота
 #   scripts/eratrade.sh logs [сервис]  — логи (по умолчанию всех сервисов)
 #   scripts/eratrade.sh dev       — разработка: БД в Docker, API и панель локально с перезагрузкой
-#   scripts/eratrade.sh mm-start  — маркет-мейкер с живыми заявками (котирует в режиме LIVE_ENABLED)
-#   scripts/eratrade.sh mm-stop   — остановить маркет-мейкер (заявки снимаются, позиция остаётся)
+#   scripts/eratrade.sh wick-start — ловля проколов с живыми заявками (покупает в режиме «Торгует»)
+#   scripts/eratrade.sh wick-stop  — остановить (покупки снимаются, продажа и стоп остаются)
+#   scripts/eratrade.sh mm-start / mm-stop — прежний маркет-мейкер
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -125,7 +126,7 @@ cmd_up() {
 cmd_down() {
   bold "Остановка EraTrade"
   echo "Маркет-мейкер снимет заявки; позиция (если есть) останется."
-  "${COMPOSE[@]}" --profile live stop mm-mainnet >/dev/null 2>&1 || true
+  "${COMPOSE[@]}" --profile live stop mm-mainnet wick-mainnet >/dev/null 2>&1 || true
   compose down
   green "Остановлено. Данные БД сохранены (volume eratrade_pg_data)."
 }
@@ -183,6 +184,22 @@ cmd_mm_stop() {
   green "Остановлен: заявки сняты. Позицию (если есть) закрыть в панели или вручную."
 }
 
+cmd_wick_start() {
+  check_env
+  [[ -f data/wick/scan.json ]] || { red "Нет отбора монет: ERATRADE_ENV_FILE=$ENV_MAIN uv run eratrade wick-scan"; exit 1; }
+  bold "Ловля проколов: живые заявки"
+  "${COMPOSE[@]}" --profile live stop mm-mainnet >/dev/null 2>&1 || true
+  "${COMPOSE[@]}" --profile live up -d --build wick-mainnet
+  echo "Покупает только в режиме «Торгует» (панель → Управление → «Запустить торговлю»)."
+  echo "Логи: scripts/eratrade.sh logs wick-mainnet"
+}
+
+cmd_wick_stop() {
+  bold "Остановка ловли проколов"
+  "${COMPOSE[@]}" --profile live stop wick-mainnet
+  green "Остановлен: покупки сняты, продажа и стоп остаются на бирже."
+}
+
 case "${1:-}" in
   up) cmd_up ;;
   down) cmd_down ;;
@@ -190,10 +207,12 @@ case "${1:-}" in
   status) cmd_status ;;
   logs) shift; cmd_logs "$@" ;;
   dev) cmd_dev ;;
+  wick-start) cmd_wick_start ;;
+  wick-stop) cmd_wick_stop ;;
   mm-start) cmd_mm_start ;;
   mm-stop) cmd_mm_stop ;;
   *)
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

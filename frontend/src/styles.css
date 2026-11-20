@@ -390,6 +390,64 @@ code {
 .reasons { display: flex; flex-wrap: wrap; gap: 6px; }
 .reason { font-size: 12px; color: var(--text-2); background: var(--surface-3); padding: 3px 9px; border-radius: 999px; }
 
+/* --- ловля проколов --- */
+.wick-pos { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; }
+.wick-pos-value { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.levels { display: inline-flex; gap: 5px; margin: 4px 0; }
+.lvl { width: 22px; height: 8px; border-radius: 4px; background: var(--surface-3); border: 1px solid var(--border-strong); }
+.lvl.on { background: var(--accent); border-color: var(--accent); }
+
+/* --- команды --- */
+.row-cmd { grid-template-columns: 1fr 1.1fr; align-items: start; }
+.cmd-groups { display: flex; flex-direction: column; gap: 18px; }
+.cmd-list { list-style: none; margin: 0; padding: 0; }
+.cmd-item { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.cmd-item:last-child { border-bottom: 0; }
+.cmd-text { min-width: 0; }
+.cmd-text .pill { margin-left: 8px; }
+.cmd-run { display: flex; gap: 6px; flex: none; }
+.cmd-run select {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+}
+.cmd-output { position: sticky; top: 76px; }
+.cmd-state { display: inline-flex; align-items: center; gap: 8px; text-transform: none; letter-spacing: 0; }
+.cmd-title { margin-bottom: 8px; }
+.console {
+  margin: 0;
+  background: #05070a;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font: 12px/1.55 ui-monospace, "SFMono-Regular", Menlo, monospace;
+  color: #cfd6e4;
+  white-space: pre;
+  overflow: auto;
+  max-height: 70vh;
+  min-height: 240px;
+}
+
+/* --- поиск монет --- */
+.scan-action { display: flex; gap: 8px; align-items: center; }
+.scan-action select {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+}
+.scan-progress { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+.scan-log { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.scan-meta { margin-bottom: 8px; }
+.scan-pre { margin: 6px 0 0; font-size: 12px; white-space: pre-wrap; }
+.card-head .scan-action { text-transform: none; letter-spacing: 0; }
+
 /* --- автовыбор --- */
 .cands { display: flex; flex-direction: column; gap: 4px; }
 .cand {
@@ -557,6 +615,8 @@ input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(52, 211, 1
   .hero { grid-template-columns: 1fr 1fr; }
   .hero-chart { grid-column: 1 / -1; order: 3; border-left: 0 !important; border-top: 1px solid var(--border); }
   .row-3-2 { grid-template-columns: 1fr; }
+  .row-cmd { grid-template-columns: 1fr; }
+  .cmd-output { position: static; }
 }
 @media (max-width: 720px) {
   .topbar-inner { flex-wrap: wrap; padding: 10px 16px; gap: 10px; }
@@ -572,6 +632,7 @@ input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(52, 211, 1
   .quote { grid-template-columns: 80px auto 1fr; }
   .quote .pill { display: none; }
   .hide-sm { display: none; }
+  .card-head { flex-wrap: wrap; gap: 10px; }
   .cand { grid-template-columns: 20px 1fr 1fr; }
   .cand .num:nth-of-type(2), .cand-bar { display: none; }
 }

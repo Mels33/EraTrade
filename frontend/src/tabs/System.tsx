@@ -16,7 +16,7 @@ export function System({ status }: { status: Status }) {
 
 function Services({ status }: { status: Status }) {
   const byName = Object.fromEntries(status.components.map((c) => [c.component, c]));
-  const names = ["mm"];
+  const names = ["wick"];
   return (
     <Card title="Сервисы" hint="Фоновые процессы в Docker. Каждый отмечается раз в несколько секунд.">
       <ul className="list">

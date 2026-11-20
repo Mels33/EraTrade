@@ -57,3 +57,27 @@ def test_ineligible_current_coin_is_replaced_and_no_candidates_keeps_current() -
     scans = [m("A", 8, 5), m("B", 6, 20), m("C", 2, 50)]  # C: спред сузился
     assert choose_coins(scans, ["C", "B"], **KW)[0] == ["B", "A"]  # type: ignore[arg-type]
     assert choose_coins([m("C", 2, 50)], ["C", "B"], **KW)[0] == ["C", "B"]  # type: ignore[arg-type]
+
+
+def test_empty_top_of_book_is_rejected() -> None:
+    scans = [
+        MarketScan("THIN", D(1), D(12), D("0.5"), D(3_000_000), D(5), 5, 1),  # $5 на лучшей цене
+        MarketScan("OK", D(1), D(9), D("0.5"), D(2_000_000), D(200), 5, 1),
+    ]
+    kw = {**KW, "min_spread_bps": D(8), "min_volume_usd": D(1_000_000)}
+    target, _ = choose_coins(scans, [], min_top_depth_usd=D(50), **kw)  # type: ignore[arg-type]
+    assert target == ["OK"]
+
+
+def test_adverse_selection_reduces_edge_and_rejects_negative_expected_profit() -> None:
+    from dataclasses import replace
+
+    scans = [
+        replace(m("A", 8, 5), adverse_selection_bps=D(3)),
+        m("B", 6, 20),
+        m("C", 5.5, 3),
+    ]
+    target, ranked = choose_coins(scans, [], **KW)  # type: ignore[arg-type]
+    assert scans[0].edge_bps == D(-1)
+    assert target == ["B", "C"]
+    assert [s.coin for s in ranked] == ["B", "C"]

@@ -58,7 +58,6 @@ def validate_transition(
         return
 
     # Оператор.
+    # Оператор переключает любой допустимый в сети режим (фраза подтверждения mainnet — в API/CLI).
     if not reason or not reason.strip():
         raise TransitionError("оператор должен указать причину смены режима")
-    if target is TradingMode.LIVE_ENABLED and current is not TradingMode.LIVE_PAUSED:
-        raise TransitionError("LIVE_ENABLED включается только из LIVE_PAUSED")

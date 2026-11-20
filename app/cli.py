@@ -7,6 +7,7 @@ import signal
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -385,29 +386,91 @@ def mm_scan(
     samples: int = typer.Option(3, help="Замеров стакана на рынок"),
 ) -> None:
     """Рынки Hyperliquid для маркет-мейкинга: спред, шаг цены, оборот (ключ не нужен)."""
+    from app.mm.adverse import load_adverse_selection
     from app.mm.scanner import candidates, scan
 
     settings = _load_settings()
     configure_logging(settings, service="cli")
+    strategy = load_strategy(settings.strategy_config_path)
+    cfg = strategy.mm
+    adverse = load_adverse_selection(Path(cfg.adverse_selection_path))
 
     async def _scan() -> list[Any]:
         async with open_gateway(settings) as gw:
-            return await scan(gw, top=top, samples=samples)
+            return await scan(gw, top=top, samples=samples, adverse_selection=adverse)
 
     scans = asyncio.run(_scan())
-    good = {s.coin for s in candidates(scans)}
+    good = {
+        s.coin
+        for s in candidates(
+            scans,
+            min_spread_bps=cfg.select_min_spread_bps,
+            max_spread_bps=cfg.select_max_spread_bps,
+            min_volume_usd=cfg.select_min_volume_usd,
+            min_top_depth_usd=cfg.select_min_top_depth_usd,
+        )
+    }
     typer.echo(
-        f"{'монета':10} {'цена':>10} {'спред bp':>8} {'шаг bp':>7} {'оборот $M':>9} "
-        f"{'на лучшей $':>11}"
+        f"{'монета':10} {'цена':>10} {'спред bp':>8} {'шаг bp':>7} {'adverse':>8} "
+        f"{'edge bp':>8} {'оборот $M':>9} {'на лучшей $':>11}"
     )
     for s in sorted(scans, key=lambda s: -s.spread_bps):
         mark = "  ← кандидат" if s.coin in good else ""
         typer.echo(
-            f"{s.coin:10} {float(s.mid):10.5g} {float(s.spread_bps):8.2f} {float(s.tick_bps):7.2f} "
-            f"{float(s.day_volume_usd) / 1e6:9.1f} {float(s.top_depth_usd):11.0f}{mark}"
+            f"{s.coin:10} {float(s.mid):10.5g} {float(s.spread_bps):8.2f} "
+            f"{float(s.tick_bps):7.2f} {float(s.adverse_selection_bps):8.2f} "
+            f"{float(s.edge_bps):8.2f} {float(s.day_volume_usd) / 1e6:9.1f} "
+            f"{float(s.top_depth_usd):11.0f}{mark}"
         )
-    strategy = load_strategy(settings.strategy_config_path)
-    typer.echo(f"\nВ конфиге [mm] coins: {', '.join(strategy.mm.coins) or '—'}")
+    typer.echo(f"\nВ конфиге [mm] coins: {', '.join(cfg.coins) or '—'}")
+
+
+@app.command("mm-backtest")
+def mm_backtest_cmd(
+    coin: str,
+    book: list[Path] = typer.Option(..., "--book", help="JSONL со снимками l2Book"),
+    trades: list[Path] = typer.Option(..., "--trades", help="JSONL с публичными сделками"),
+    sz_decimals: int | None = typer.Option(None, help="Точность размера; без неё — запрос meta"),
+    maker_fee_bps: float = typer.Option(1.5, help="Комиссия maker за исполнение, bp"),
+    markouts: str = typer.Option("1,5,30,60", help="Горизонты markout в секундах"),
+    selection_horizon: int = typer.Option(30, help="Markout для последующего выбора монет"),
+    latency_ms: int = typer.Option(500, min=0, help="Задержка выставления/перестановки"),
+    out: Path = typer.Option(Path("data/mm/adverse_selection.json"), "--out"),
+) -> None:
+    """Бэктест очереди и adverse selection по архиву Hyperliquid, без свечной аппроксимации."""
+    from app.mm.adverse import save_adverse_selection
+    from app.research.mm_backtest import run_files
+
+    settings = _load_settings()
+    configure_logging(settings, service="research")
+    if sz_decimals is None:
+
+        async def _rules() -> InstrumentRules:
+            async with open_gateway(settings) as gw:
+                return InstrumentRules.for_perp(await gw.get_market(coin))
+
+        rules = asyncio.run(_rules())
+    else:
+        if not 0 <= sz_decimals <= 6:
+            raise typer.BadParameter("sz-decimals должен быть от 0 до 6")
+        rules = InstrumentRules(coin, 0, sz_decimals, 6 - sz_decimals)
+    horizons = [int(value) for value in markouts.split(",") if value.strip()]
+    if selection_horizon not in horizons:
+        raise typer.BadParameter("selection-horizon должен быть в списке markouts")
+    cfg = load_strategy(settings.strategy_config_path).mm
+    result = run_files(
+        coin,
+        book,
+        trades,
+        rules,
+        cfg,
+        maker_fee=Decimal(str(maker_fee_bps)) / 10_000,
+        markout_seconds=horizons,
+        quote_latency_ms=latency_ms,
+    )
+    save_adverse_selection(result, out, horizon_seconds=selection_horizon)
+    typer.echo(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
+    typer.echo(f"Измерение для выбора монет сохранено: {out}")
 
 
 @app.command("mm")
@@ -479,6 +542,260 @@ def mm_run(
 
 
 # --- модель «спрос и предложение»: публичные данные Binance ---
+
+
+@app.command("sd-research")
+def sd_research(
+    idea: str = typer.Option("all", help="zones | walls | imbalance | all"),
+    minute_dir: str = typer.Option("data/micro/bars", help="Минутные строки (micro-data)"),
+    cache: str = typer.Option("data/micro/hourly/BTCUSDT-1h.csv.gz", help="Кэш часовых свечей"),
+) -> None:
+    """Спрос и предложение на горизонте часы — 1–2 дня: честная проверка по кварталам."""
+    from pathlib import Path
+
+    from app.research.hourly import load_hourly
+    from app.research.sd_walkforward import IDEAS, summary, walk_forward
+
+    ideas = list(IDEAS) if idea == "all" else [idea]
+    if any(i not in IDEAS for i in ideas):
+        typer.secho(f"неизвестная идея: {idea}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    h = load_hourly(Path(minute_dir), Path(cache))
+    typer.echo(f"Часовых свечей: {len(h)} ({h.index[0]:%Y-%m-%d} … {h.index[-1]:%Y-%m-%d})")
+
+    def pct(x: float | None) -> str:
+        return "—" if x is None else f"{x * 100:+.2f}%"
+
+    all_trades = []
+    for name in ideas:
+        result = walk_forward(h, name, progress=lambda m: typer.echo(f"  {m}", err=True))
+        typer.secho(f"\n=== {name} ===", bold=True)
+        typer.echo(
+            f"{'квартал':8} {'сделок':>6} {'средний':>9} {'сумма':>9} {'случайный':>10} "
+            f"{'p':>5} {'купил-держал':>12}  параметры"
+        )
+        for q in result.quarters:
+            nets = [f.net for f in q.trades]
+            mean = sum(nets) / len(nets) if nets else None
+            total = sum(nets) if nets else None
+            p_txt = f"{q.random_p:.2f}" if q.random_p is not None else "—"
+            typer.echo(
+                f"{q.start:%Y-%m}  {len(nets):>6} {pct(mean):>9} {pct(total):>9} "
+                f"{pct(q.random_mean):>10} {p_txt:>5} {pct(q.buy_hold):>12}  {q.params}"
+            )
+        st = summary(result, h.index)
+        all_trades += result.trades(h.index)
+        t = st["t_stat"]
+        passed = (
+            st["mean_net"] is not None
+            and st["mean_net"] > 0
+            and t is not None
+            and t > 2
+            and st["quarters_positive"] >= 7
+            and (st["random_mean"] is None or st["mean_net"] > st["random_mean"])
+        )
+        hit = "—" if st["hit_rate"] is None else f"{st['hit_rate'] * 100:.0f}%"
+        t_txt = "—" if t is None else f"{t:.2f}"
+        typer.echo(
+            f"итог: {st['trades']} сделок ({st['per_day'] * 7:.1f} в неделю), прибыльных {hit}, "
+            f"средний {pct(st['mean_net'])}, сумма {pct(st['sum_net'])}, t = {t_txt}"
+        )
+        typer.echo(
+            f"кварталов в плюсе {st['quarters_positive']}/{st['quarters_traded']}, "
+            f"случайный вход {pct(st['random_mean'])} — ворота: "
+            + ("ПРОЙДЕНЫ" if passed else "не пройдены")
+        )
+    if len(ideas) > 1 and all_trades:
+        nets = [t.net for t in all_trades]
+        typer.secho(
+            f"\nВсе идеи вместе: {len(nets)} сделок, средний {pct(sum(nets) / len(nets))}, "
+            f"сумма {pct(sum(nets))}",
+            bold=True,
+        )
+
+
+@app.command("averaging-research")
+def averaging_research(
+    minute_dir: str = typer.Option("data/micro/bars", help="Минутные строки (micro-data)"),
+) -> None:
+    """Скальпинг с усреднением (докупка до N уровней, продажа на +tp от средней) на истории."""
+    from pathlib import Path
+
+    import numpy as np
+    import pandas as pd
+
+    from app.research.averaging import AvgParams, run
+    from app.research.micro_bars import load_bars
+
+    b = load_bars(Path(minute_dir))
+    close = b["close"].ffill().to_numpy(float)
+    high = b["high"].fillna(b["close"]).ffill().to_numpy(float)
+    low = b["low"].fillna(b["close"]).ffill().to_numpy(float)
+    years = pd.DatetimeIndex(b["minute"]).year.to_numpy()
+    typer.echo(
+        f"BTC минутные: {b['minute'].iloc[0]:%Y-%m-%d} … {b['minute'].iloc[-1]:%Y-%m-%d}, "
+        f"купил и держал {close[-1] / close[0] - 1:+.0%}"
+    )
+    grid = [
+        AvgParams(step=st, levels=lv, tp=tp, stop=stop, side=side)
+        for side in ("long", "short")
+        for st in (0.003, 0.005, 0.01)
+        for lv in (3, 5)
+        for tp in (0.003, 0.005)
+        for stop in (True, False)
+    ]
+    uniq_years = sorted(set(years))
+    typer.echo(
+        f"{'сторона':6} {'шаг':>5} {'ур.':>3} {'цель':>5} {'стоп':>4} {'циклов':>7} {'в плюс':>7} "
+        f"{'итог':>8} {'просадка':>9} {'худший':>8}  " + " ".join(f"{y:>7}" for y in uniq_years)
+    )
+    for p in grid:
+        r = run(high, low, close, p)
+        eq = np.r_[0.0, r.equity]
+        by_year = []
+        for y in uniq_years:
+            idx = np.flatnonzero(years == y)
+            by_year.append(eq[idx[-1] + 1] - eq[idx[0]])
+        typer.echo(
+            f"{p.side:6} {p.step:>5.1%} {p.levels:>3} {p.tp:>5.1%} {'да' if p.stop else 'нет':>4} "
+            f"{r.cycles:>7} {r.wins / max(r.cycles, 1):>7.0%} {r.total:>+8.1%} "
+            f"{r.max_drawdown:>+9.1%} {r.worst_cycle:>+8.1%}  "
+            + " ".join(f"{v:>+7.1%}" for v in by_year)
+        )
+
+
+@app.command("wick-scan")
+def wick_scan_cmd(
+    top: int = typer.Option(40, help="Сколько монет Hyperliquid с наибольшим оборотом проверить"),
+    months: int = typer.Option(18, help="Месяцев истории (полных)"),
+    test_months: int = typer.Option(6, help="Из них последних — на проверку"),
+    out: str = typer.Option("data/wick/scan.json", help="Куда сохранить результат"),
+) -> None:
+    """Поиск монет для ловли проколов с усреднением: честная проверка на истории Binance."""
+    from pathlib import Path
+
+    from app.research.wick_scan import current_month_days, months_back, save, scan
+
+    settings = _load_settings()
+    configure_logging(settings, service="cli")
+
+    async def _coins() -> list[str]:
+        async with open_gateway(settings) as gw:
+            markets, contexts = await gw.get_markets_with_contexts()
+        live = [m for m in markets if not m.is_delisted and m.coin in contexts]
+        live.sort(key=lambda m: contexts[m.coin].day_notional_volume or 0, reverse=True)
+        return [m.coin for m in live[:top]]
+
+    coins = asyncio.run(_coins())
+    period = months_back(months)
+    days = current_month_days()
+    last = days[-1].isoformat() if days else period[-1]
+    typer.echo(
+        f"Монет: {len(coins)}; история {period[0]} … {last}, "
+        f"проверка — последние {test_months} мес. и текущий месяц"
+    )
+    results = scan(
+        coins,
+        months=period,
+        test_months=test_months,
+        raw_dir=Path("data/wick/raw"),  # сырые zip удаляются сразу после разбора
+        cache_dir=Path("data/wick/klines"),
+        days=days,
+        progress=lambda m: typer.echo(f"  {m}", err=True),
+    )
+    save(results, Path(out), months=period, test_months=test_months, days=days, universe=len(coins))
+
+    def pct(x: float | None) -> str:
+        return "—" if x is None else f"{x:+.1%}"
+
+    typer.echo(
+        f"\n{'монета':9} {'обучение':>9} {'проверка':>9} {'просадка':>9} {'циклов':>7} "
+        f"{'в плюс':>7}  параметры"
+    )
+    for r in results:
+        prm = f"шаг {r.params.step:.1%}, цель {r.params.tp:.1%}" if r.params else "—"
+        mark = "  ✓" if r.passed else ""
+        wins = f"{r.test_wins / r.test_cycles:.0%}" if r.test_cycles else "—"
+        typer.echo(
+            f"{r.coin:9} {pct(r.train_total):>9} {pct(r.test_total):>9} {pct(r.test_drawdown):>9} "
+            f"{r.test_cycles:>7} {wins:>7}  {prm}{mark}"
+        )
+    tested = [r for r in results if r.test_total is not None]
+    positive = [r for r in tested if (r.test_total or 0) > 0]
+    if tested:
+        mean = sum(r.test_total or 0 for r in tested) / len(tested)
+        typer.secho(
+            f"\nНа проверке в плюсе {len(positive)}/{len(tested)} монет, средний {mean:+.1%}; "
+            f"прошли отбор: {', '.join(r.coin for r in results if r.passed) or '—'}",
+            bold=True,
+        )
+
+
+@app.command("wick")
+def wick_run(
+    yes: bool = typer.Option(False, "--yes", help="Запуск без вопроса (для Docker)"),
+) -> None:
+    """Живой бот «ловля проколов с усреднением» (нужен ключ). Покупает только в LIVE_ENABLED."""
+    from pathlib import Path
+
+    from app.wick.trader import WickTrader, load_plans
+
+    settings = _load_settings()
+    configure_logging(settings, service="wick")
+    cfg = load_strategy(settings.strategy_config_path).wick
+    if settings.hl_account_address is None:
+        typer.secho("Не задан HL_ACCOUNT_ADDRESS", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    plans = load_plans(cfg, Path(cfg.scan_path))
+    if not plans:
+        typer.secho(f"Нет отбора монет в {cfg.scan_path} — eratrade wick-scan", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+    sizes = " → ".join(f"{cfg.base_usd * cfg.size_mult**k:.1f}" for k in range(cfg.levels))
+    typer.echo(
+        f"Ловля проколов {settings.network.value}: "
+        + ", ".join(f"{p.coin} (шаг {p.step:.1%}, цель {p.tp:.1%})" for p in plans)
+        + f"; покупки {sizes} USDC; "
+        + (
+            "дневной лимит отключён."
+            if cfg.daily_loss_usd == 0
+            else f"дневной убыток ≤ {cfg.daily_loss_usd} USDC."
+        )
+    )
+    if not yes and not typer.confirm("Запустить с реальными заявками?"):
+        raise typer.Exit(code=1)
+
+    async def _run() -> None:
+        task = asyncio.current_task()
+        loop = asyncio.get_running_loop()
+        if task is not None:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, task.cancel)
+        engine = create_engine(settings)
+        try:
+            async with (
+                open_gateway(settings) as gw,
+                open_trading_session(settings, engine, gw) as session,
+            ):
+                trader = WickTrader(
+                    session,
+                    gw,
+                    create_sessionmaker(engine),
+                    cfg,
+                    network=settings.network,
+                    user=(settings.hl_account_address or "").lower(),
+                    ws_url=settings.hyperliquid_ws_url,
+                    scan_path=Path(cfg.scan_path),
+                    notifier=build_notifier(settings),
+                )
+                await trader.run()
+        finally:
+            await engine.dispose()
+
+    try:
+        asyncio.run(_run())
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    typer.echo("Бот остановлен: покупки сняты, продажа и стоп остаются на бирже.")
 
 
 @app.command("micro-data")

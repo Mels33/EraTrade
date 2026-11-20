@@ -21,14 +21,10 @@ def check(
     validate_transition(network=network, current=current, target=target, actor=actor, reason=reason)
 
 
-def test_operator_enables_live_from_paused() -> None:
-    check(M.LIVE_PAUSED, M.LIVE_ENABLED, OPERATOR)
-
-
-@pytest.mark.parametrize("current", [M.DISABLED, M.SHADOW])
-def test_live_enabled_only_from_paused(current: TradingMode) -> None:
-    with pytest.raises(TransitionError, match="только из LIVE_PAUSED"):
-        check(current, M.LIVE_ENABLED, OPERATOR)
+@pytest.mark.parametrize("current", [M.DISABLED, M.SHADOW, M.LIVE_PAUSED])
+def test_operator_enables_live_from_any_mode(current: TradingMode) -> None:
+    check(current, M.LIVE_ENABLED, OPERATOR)
+    check(M.LIVE_ENABLED, current, OPERATOR)  # и выключает в любой режим
 
 
 @pytest.mark.parametrize("reason", [None, "", "   "])

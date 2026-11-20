@@ -8,9 +8,12 @@ coins = ["FARTCOIN", "VVV"]   # стартовые монеты; при auto_sel
 auto_select = true          # раз в rescan_minutes выбирать лучшие монеты сканером
 max_coins = 2
 rescan_minutes = 180
-select_min_spread_bps = 5   # медианный спред кандидата (запас над порогом котирования)
+select_min_spread_bps = 8   # только широкий спред: с запасом покрывает комиссии maker (3 bp за круг)
 select_max_spread_bps = 30  # шире — «мёртвый» рынок с резкими скачками
-select_min_volume_usd = 2000000
+select_min_volume_usd = 1000000
+select_min_top_depth_usd = 50  # на лучшей цене меньше — рынок «пустой», сделки там информированные
+select_scan_top = 70        # широкоспредовые монеты ниже в рейтинге оборота
+adverse_selection_path = "data/mm/adverse_selection.json"  # измерения eratrade mm-backtest
 select_hysteresis = 0.3     # заменить текущую монету, только если кандидат лучше на 30%
 exclude = []                # монеты, которые никогда не торговать
 retire_flatten_minutes = 60 # уходим с монеты: столько ждём закрытия позиции заявкой, потом по рынку
@@ -18,16 +21,36 @@ order_usd = 12              # размер заявки (биржевой мин
 max_inventory_usd = 25      # предел позиции по монете в любую сторону
 daily_loss_usd = 2          # реализованный + нереализованный PnL за сутки UTC → стоп, закрыть, запрет
 leverage = 3                # isolated
-min_spread_bps = 4          # уже — не котировать
-improve_min_ticks = 3       # спред ≥ N шагов цены → встать на шаг лучше лучшей цены
+min_spread_bps = 6          # уже — новую позицию не набирать, только закрывать
+improve_min_ticks = 3       # спред ≥ N шагов цены → можно встать на шаг лучше лучшей цены
+min_edge_bps = 2            # заявка не ближе N bp от справедливой цены (глубже лучшей цены — «отравленные» исполнения)
+inventory_skew_bps = 1.5    # справедливая цена сдвигается против позиции: N bp при полной позиции
 flow_window_seconds = 30    # окно потока агрессивных сделок
 flow_min_usd = 1000         # меньше оборота в окне — поток не учитывается
 flow_pull_imbalance = 0.6   # |покупки − продажи| / сумма ≥ порога → снять сторону против потока
 requote_min_interval_seconds = 3
+requote_slack_bps = 1       # заявку не переставлять, если она в пределах N bp (минимум шаг цены) от нужной
 max_actions_per_minute = 12 # заявки/отмены/перестановки (лимит запросов адреса)
 min_requests_remaining = 20000
-stale_book_seconds = 10     # стакан не обновлялся дольше — снять котировки
+stale_book_seconds = 60     # стакан не обновлялся дольше — снять котировки (тихие монеты молчат подолгу)
 sync_seconds = 5            # сверка позиции и заявок с биржей
 dms_horizon_seconds = 120   # scheduleCancel: биржа снимет заявки, если процесс завис/упал
 dms_refresh_seconds = 60
+
+[wick]
+# Ловля проколов с усреднением: лимит на покупку на «шаг» ниже цены, докупки до levels
+# уровней (каждая в size_mult раз больше), продажа всей позиции лимитом на +цель от средней,
+# после последнего уровня — стоп на бирже. Шаг и цель на монету — из отбора (eratrade wick-scan).
+scan_path = "data/wick/scan.json"
+coins = []                  # ручной список (пусто — лучшие из отбора)
+max_coins = 4
+base_usd = 12               # первая покупка
+size_mult = 1.2             # 12 → 14.4 → 17.3 USDC
+levels = 3
+leverage = 3
+daily_loss_usd = 0          # 0 — дневной стоп по убытку отключён
+requote_frac = 0.25         # заявку на вход переставлять, когда цена ушла на четверть шага
+max_actions_per_minute = 15
+sync_seconds = 5
+stop_slippage = 0.05        # стоп по рынку не хуже −5% от цены срабатывания
 

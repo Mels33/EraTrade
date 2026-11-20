@@ -6,7 +6,7 @@ import { ApiError, command, type CommandResult, type Status } from "../api";
 const PHRASE = "I_UNDERSTAND_REAL_MONEY";
 
 export interface CommandSpec {
-  id: "start" | "pause" | "stop";
+  id: "start" | "pause" | "resume" | "stop";
   label: string;
   path: string;
   tone: "primary" | "warn" | "danger";
@@ -33,6 +33,13 @@ export const COMMANDS: CommandSpec[] = [
     what: "Маркет-мейкер снимает все заявки. Открытая позиция остаётся — её можно закрыть кнопкой «Остановить».",
   },
   {
+    id: "resume",
+    label: "Снять запрет входов",
+    path: "/api/bot/resume",
+    tone: "warn",
+    what: "Снимает запрет после разбора (лимит убытка, пауза). Режим не меняется: чтобы торговать, нужен режим «Торгует».",
+  },
+  {
     id: "stop",
     label: "Остановить и закрыть позиции",
     path: "/api/bot/stop",
@@ -46,6 +53,7 @@ function available(c: CommandSpec, s: Status): boolean {
   const live = s.mode === "LIVE_ENABLED" && !s.entries_blocked;
   if (c.id === "start") return !live;
   if (c.id === "pause") return live;
+  if (c.id === "resume") return s.entries_blocked;
   return s.mode !== "DISABLED";
 }
 

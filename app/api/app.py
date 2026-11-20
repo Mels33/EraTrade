@@ -3,7 +3,9 @@
 Деньги и размеры отдаются строками (Decimal без потери точности).
 """
 
+import asyncio
 import hmac
+import json
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -19,12 +21,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 
 from app.api.context import ApiContext
+from app.api.jobs import COMMANDS, JobError, catalog
 from app.config.settings import MAINNET_CONFIRMATION_PHRASE, TradingMode
 from app.db.models import ApiRequestRecord, AuditLogRecord
 from app.db.repositories import control
 from app.db.repositories import mm as mm_repo
 from app.domain.control import Actor, ActorKind, TransitionError
 from app.execution.lock import AnotherTraderRunningError
+from app.integrations.hyperliquid.gateway import open_gateway
 
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 API_ACTOR = Actor(ActorKind.OPERATOR, "api")
@@ -91,6 +95,50 @@ async def health_ready(ctx: Ctx) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+@read.get("/account")
+async def account_overview(ctx: Ctx) -> dict[str, Any]:
+    """Актуальные позиции и ордера с биржи, независимо от heartbeat стратегии."""
+    user = ctx.settings.hl_account_address
+    if user is None:
+        raise HTTPException(status_code=503, detail="не задан HL_ACCOUNT_ADDRESS")
+    try:
+        async with open_gateway(ctx.settings, service="trading") as gw:
+            account, orders, mids = await asyncio.gather(
+                gw.get_account_state(user), gw.get_open_orders(user), gw.get_all_mids()
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="биржа временно недоступна") from exc
+    return {
+        "time": _t(account.exchange_time),
+        "account_value": str(account.account_value),
+        "withdrawable": str(account.withdrawable),
+        "positions": [
+            {
+                "coin": p.coin,
+                "size": str(p.size),
+                "entry_price": _s(p.entry_price),
+                "position_value": str(p.position_value),
+                "unrealized_pnl": str(p.unrealized_pnl),
+                "mid": _s(mids.get(p.coin)),
+            }
+            for p in account.positions
+        ],
+        "orders": [
+            {
+                "coin": o.coin,
+                "side": o.side.value,
+                "price": _s(o.trigger_price if o.is_trigger else o.limit_price),
+                "size": str(o.size),
+                "order_type": o.order_type,
+                "reduce_only": o.reduce_only,
+                "is_trigger": o.is_trigger,
+                "oid": o.oid,
+            }
+            for o in orders
+        ],
+    }
+
+
 @read.get("/mm")
 async def mm_overview(ctx: Ctx, days: int = Query(7, ge=1, le=90)) -> dict[str, Any]:
     """Маркет-мейкер: живое состояние (heartbeat), последние исполнения, итоги по дням."""
@@ -138,6 +186,83 @@ async def mm_overview(ctx: Ctx, days: int = Query(7, ge=1, le=90)) -> dict[str, 
         "daily": [
             {k: (str(v) if isinstance(v, Decimal) else v) for k, v in row.items()} for row in daily
         ],
+    }
+
+
+@read.get("/wick")
+async def wick_overview(ctx: Ctx, days: int = Query(7, ge=1, le=90)) -> dict[str, Any]:
+    """Ловля проколов: живое состояние (heartbeat wick), исполнения, итоги по дням, кривая."""
+    data = await mm_overview(ctx, days)
+    async with ctx.sm() as db:
+        beat = next((h for h in await control.get_heartbeats(db) if h.component == "wick"), None)
+    now = ctx.clock()
+    cfg = ctx.strategy.wick
+    data["config"] = {
+        "max_coins": cfg.max_coins,
+        "levels": cfg.levels,
+        "levels_usd": [str(round(cfg.base_usd * cfg.size_mult**k, 2)) for k in range(cfg.levels)],
+        "daily_loss_usd": str(cfg.daily_loss_usd),
+    }
+    data["live"] = (
+        {
+            "last_beat_age_s": round((now - beat.last_beat_at).total_seconds(), 1),
+            "started_at": _t(beat.started_at),
+            **beat.details,
+        }
+        if beat
+        else None
+    )
+    return data
+
+
+class ScanBody(BaseModel):
+    top: int = Field(default=80, ge=10, le=200)
+
+
+def _scan_result(ctx: ApiContext) -> dict[str, Any] | None:
+    path = Path(ctx.strategy.wick.scan_path)
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    return {
+        "at": data.get("at"),
+        "train": data.get("train"),
+        "test": data.get("test"),
+        "universe": data.get("universe"),
+        "coins": [
+            {
+                "coin": c["coin"],
+                "passed": c.get("passed", False),
+                "test_total": c.get("test_total"),
+                "test_drawdown": c.get("test_drawdown"),
+                "test_cycles": c.get("test_cycles"),
+                "test_wins": c.get("test_wins"),
+                "step": (c.get("params") or {}).get("step"),
+                "tp": (c.get("params") or {}).get("tp"),
+            }
+            for c in data.get("coins", [])
+        ],
+    }
+
+
+def _scan_job(ctx: ApiContext) -> dict[str, Any]:
+    """Ход поиска монет — если последней запускалась именно она."""
+    st = ctx.jobs.status(lines=12)
+    if st["name"] != "wick-scan":
+        return {**st, "state": "idle", "log": []}
+    return st
+
+
+@read.get("/wick/scan")
+async def wick_scan_status(ctx: Ctx) -> dict[str, Any]:
+    """Поиск монет: ход последнего запуска и результат отбора."""
+    async with ctx.sm() as db:
+        beat = next((h for h in await control.get_heartbeats(db) if h.component == "wick"), None)
+    return {
+        "job": _scan_job(ctx),
+        "result": _scan_result(ctx),
+        "trading": list((beat.details.get("coins") or {}).keys()) if beat else [],
+        "max_coins": ctx.strategy.wick.max_coins,
     }
 
 
@@ -230,6 +355,44 @@ async def _idempotent(
 
 
 IdemKey = Annotated[str | None, Header(alias="Idempotency-Key")]
+
+
+@control_router.post("/wick/scan")
+async def wick_scan_start(body: ScanBody, ctx: Ctx, actor: Operator) -> dict[str, Any]:
+    """Запустить поиск новых монет (eratrade wick-scan --top N). Бот подхватит отбор сам."""
+    return await _start_job(ctx, actor, "wick-scan", {"top": str(body.top)})
+
+
+class JobBody(BaseModel):
+    args: dict[str, str] = Field(default_factory=dict)
+
+
+@read.get("/jobs")
+async def jobs(ctx: Ctx) -> dict[str, Any]:
+    """Команды CLI, доступные из панели, и ход последней."""
+    return {"commands": catalog(), "job": ctx.jobs.status()}
+
+
+@control_router.post("/jobs/{name}")
+async def job_start(name: str, body: JobBody, ctx: Ctx, actor: Operator) -> dict[str, Any]:
+    return await _start_job(ctx, actor, name, body.args)
+
+
+async def _start_job(
+    ctx: ApiContext, actor: Actor, name: str, args: dict[str, str]
+) -> dict[str, Any]:
+    if name not in COMMANDS:
+        raise HTTPException(status_code=404, detail=f"нет команды {name}")
+    try:
+        ctx.jobs.start(name, args)
+    except JobError as exc:
+        status = 409 if ctx.jobs.running else 422
+        raise HTTPException(status_code=status, detail=str(exc)) from None
+    async with ctx.sm.begin() as db:
+        await control.record_audit(
+            db, actor=actor, action="panel.command", reason=name, details=ctx.jobs.args
+        )
+    return {"steps": [f"запущено: {COMMANDS[name].label}"], "job": ctx.jobs.status()}
 
 
 @control_router.post("/bot/pause")

@@ -70,9 +70,9 @@ async def test_same_mode_is_noop(session: AsyncSession) -> None:
 
 async def test_forbidden_transition_changes_nothing(session: AsyncSession) -> None:
     await repo.set_trading_mode(session, MAINNET, TradingMode.SHADOW, actor=OPERATOR, reason="r")
-    with pytest.raises(TransitionError):
+    with pytest.raises(TransitionError):  # автоматика не может включить торговлю
         await repo.set_trading_mode(
-            session, MAINNET, TradingMode.LIVE_ENABLED, actor=OPERATOR, reason="r"
+            session, MAINNET, TradingMode.LIVE_ENABLED, actor=SYSTEM, reason="r"
         )
     state = await repo.get_bot_state(session)
     assert state is not None and state.trading_mode == "SHADOW"

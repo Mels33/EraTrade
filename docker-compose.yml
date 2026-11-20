@@ -20,6 +20,29 @@ services:
       timeout: 3s
       retries: 20
 
+  # Ловля проколов с усреднением (живые заявки, нужен ключ). Монеты — из data/wick/scan.json
+  # (eratrade wick-scan). Без автоперезапуска; продажа и стоп стоят на бирже и без бота.
+  # Запуск: scripts/eratrade.sh wick-start.
+  wick-mainnet:
+    build: .
+    container_name: eratrade-wick-mainnet
+    profiles: ["live"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: [.env.mainnet, .env.mainnet.secrets]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://eratrade:${POSTGRES_PASSWORD:-eratrade_local}@postgres:5432/eratrade_mainnet
+      ERATRADE_ENV_FILE: /nonexistent
+    volumes:
+      - ./data/wick:/app/data/wick:ro
+    entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade wick --yes"]
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
   # Маркет-мейкер (живые заявки, нужен ключ). Котирует только в режиме LIVE_ENABLED;
   # пауза/kill из панели снимают котировки. Без автоперезапуска: падение = ошибка, а заявки
   # биржа снимет сама по scheduleCancel. Запуск: scripts/eratrade.sh mm-start.
@@ -57,6 +80,8 @@ services:
       ERATRADE_ENV_FILE: /nonexistent
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data  # команды из панели: отбор монет, кэш свечей, данные исследований
     entrypoint: ["sh", "-c", "/app/.venv/bin/alembic upgrade head && exec /app/.venv/bin/eratrade api --host 0.0.0.0 --allow-external"]
     stop_grace_period: 15s
     logging:

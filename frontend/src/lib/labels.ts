@@ -4,10 +4,12 @@ export type Tone = "ok" | "warn" | "bad" | "idle" | "info";
 
 const COMPONENT_LIMIT_S: Record<string, number> = {
   mm: 60,
+  wick: 60,
 };
 
 export const COMPONENTS: Record<string, { name: string; hint: string }> = {
-  mm: { name: "Маркет-мейкер", hint: "Ставит и переставляет заявки на бирже" },
+  wick: { name: "Ловля проколов", hint: "Покупки ниже цены, докупки, продажа на отскоке, стоп" },
+  mm: { name: "Маркет-мейкер", hint: "Прежняя стратегия (выключена)" },
 };
 
 export function componentState(component: string, ageS: number): { tone: Tone; text: string } {

@@ -231,3 +231,135 @@ export interface MmOverview {
   }[];
   daily: { day: string; coin: string; fills: number; volume: string; fees: string; net: string; taker_fills: number }[];
 }
+
+export interface WickCoin {
+  mid: string | null;
+  step: string;
+  tp: string;
+  levels: number;
+  level: number;
+  position: string;
+  position_usd: string | null;
+  entry_px: string | null;
+  unrealized: string;
+  buy: { price: string; size: string } | null;
+  tp_order: string | null;
+  stop_order: string | null;
+  next_stop: string | null;
+  retiring: boolean;
+  note: string;
+  foreign_orders?: number;
+  oversized?: boolean;
+}
+
+export interface WickOverview {
+  curve: { t: string; pnl: string }[];
+  config: { max_coins: number; levels: number; levels_usd: string[]; daily_loss_usd: string };
+  live: {
+    last_beat_age_s: number;
+    started_at: string;
+    state: string;
+    quoting: boolean;
+    pnl_today: string;
+    realized_today: string;
+    daily_loss_limit: string;
+    spot_usdc: string | null;
+    actions_last_min: number;
+    actions_limit: number;
+    ws: boolean;
+    scan_at: string | null;
+    levels_usd: string[];
+    coins: Record<string, WickCoin>;
+  } | null;
+  fills: MmOverview["fills"];
+  daily: MmOverview["daily"];
+}
+
+export interface AccountOverview {
+  time: string;
+  account_value: string;
+  withdrawable: string;
+  positions: {
+    coin: string;
+    size: string;
+    entry_price: string | null;
+    position_value: string;
+    unrealized_pnl: string;
+    mid: string | null;
+  }[];
+  orders: {
+    coin: string;
+    side: "buy" | "sell";
+    price: string | null;
+    size: string;
+    order_type: string;
+    reduce_only: boolean;
+    is_trigger: boolean;
+    oid: number;
+  }[];
+}
+
+export interface ScanCoin {
+  coin: string;
+  passed: boolean;
+  test_total: number | null;
+  test_drawdown: number | null;
+  test_cycles: number | null;
+  test_wins: number | null;
+  step: number | null;
+  tp: number | null;
+}
+
+export interface WickScan {
+  job: {
+    state: "idle" | "running" | "done" | "error";
+    top: number | null;
+    started_at: string | null;
+    finished_at: string | null;
+    total: number | null;
+    done: number;
+    log: string[];
+  };
+  result: {
+    at: string | null;
+    train: string[] | null;
+    test: string[] | null;
+    universe: number | null;
+    coins: ScanCoin[];
+  } | null;
+  trading: string[];
+  max_coins: number;
+}
+
+export interface JobChoice {
+  name: string;
+  label: string;
+  values: string[];
+  default: string;
+}
+
+export interface JobCommand {
+  name: string;
+  group: string;
+  label: string;
+  what: string;
+  sends_to_exchange: boolean;
+  choices: JobChoice[];
+}
+
+export interface JobStatus {
+  name: string | null;
+  args: Record<string, string>;
+  state: "idle" | "running" | "done" | "error";
+  started_at: string | null;
+  finished_at: string | null;
+  returncode: number | null;
+  total: number | null;
+  done: number;
+  log: string[];
+}
+
+export interface Jobs {
+  commands: JobCommand[];
+  job: JobStatus;
+}

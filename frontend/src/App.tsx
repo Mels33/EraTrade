@@ -4,11 +4,13 @@ import { CommandDialog, ControlsPanel, type CommandSpec } from "./components/con
 import { Dot } from "./components/ui";
 import { MODE_LABEL, modeTone } from "./lib/labels";
 import { usePoll } from "./lib/usePoll";
-import { MarketMaking } from "./tabs/MarketMaking";
+import { Wick } from "./tabs/Wick";
+import { Commands } from "./tabs/Commands";
 import { System } from "./tabs/System";
 
 const TABS = [
   { id: "trade", label: "Торговля" },
+  { id: "commands", label: "Команды" },
   { id: "system", label: "Система" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
@@ -91,7 +93,13 @@ function Dashboard({ onLogout }: { onLogout: (message?: string) => void }) {
       <main className="content">
         {status.error && !s && <p className="banner-error">Нет связи с API: {status.error}</p>}
         {status.error && s && <p className="banner-error">Связь с API прервалась, данные могут быть устаревшими</p>}
-        {!s ? <p className="empty">Загрузка…</p> : tab === "trade" ? <MarketMaking status={s} /> : <System status={s} />}
+        {!s ? <p className="empty">Загрузка…</p> : tab === "trade" ? (
+          <Wick status={s} />
+        ) : tab === "commands" ? (
+          <Commands />
+        ) : (
+          <System status={s} />
+        )}
       </main>
 
       {controlsOpen && s && (

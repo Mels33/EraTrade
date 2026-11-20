@@ -6,6 +6,7 @@
 
 import asyncio
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from statistics import median
@@ -27,11 +28,12 @@ class MarketScan:
     top_depth_usd: Decimal  # медиана min(объём на лучшем bid, на лучшем ask) в $
     max_leverage: int
     sz_decimals: int
+    adverse_selection_bps: Decimal = Decimal(0)  # средний отрицательный markout одного fill
 
     @property
     def edge_bps(self) -> Decimal:
-        """Спред минус комиссии круга maker (2 × 1.5 bp)."""
-        return self.spread_bps - 3
+        """Спред минус комиссии и adverse selection двух исполнений круга."""
+        return self.spread_bps - 3 - 2 * self.adverse_selection_bps
 
 
 async def scan(
@@ -41,6 +43,7 @@ async def scan(
     samples: int = 3,
     pause_s: float = 2.0,
     min_volume_usd: Decimal = Decimal(1_000_000),
+    adverse_selection: Mapping[str, Decimal] | None = None,
 ) -> list[MarketScan]:
     """Топ рынков по обороту за сутки; несколько замеров стакана на каждый."""
     markets, contexts = await gateway.get_markets_with_contexts()
@@ -53,6 +56,7 @@ async def scan(
     ]
     eligible.sort(key=lambda m: contexts[m.coin].day_notional_volume or 0, reverse=True)
     eligible = eligible[:top]
+    adverse_selection = adverse_selection or {}
 
     spreads: dict[str, list[Decimal]] = {m.coin: [] for m in eligible}
     depths: dict[str, list[Decimal]] = {m.coin: [] for m in eligible}
@@ -87,6 +91,7 @@ async def scan(
                 top_depth_usd=Decimal(median(depths[m.coin])),
                 max_leverage=m.max_leverage,
                 sz_decimals=m.sz_decimals,
+                adverse_selection_bps=adverse_selection.get(m.coin, Decimal(0)),
             )
         )
     return result
@@ -98,8 +103,9 @@ def candidates(
     min_spread_bps: Decimal = Decimal(4),
     max_spread_bps: Decimal = Decimal(30),
     min_volume_usd: Decimal = Decimal(1_000_000),
+    min_top_depth_usd: Decimal = Decimal(0),
 ) -> list[MarketScan]:
-    """Подходящие рынки, лучшие первыми: спред шире комиссий, но не «мёртвый» рынок.
+    """Подходящие рынки: положительный edge после комиссий и измеренного adverse selection.
 
     Слишком широкий спред (> max_spread_bps) обычно означает редкие сделки и резкие скачки
     цены — там котировку чаще «сбивают» информированные участники.
@@ -107,15 +113,18 @@ def candidates(
     good = [
         s
         for s in scans
-        if min_spread_bps <= s.spread_bps <= max_spread_bps and s.day_volume_usd >= min_volume_usd
+        if min_spread_bps <= s.spread_bps <= max_spread_bps
+        and s.edge_bps > 0
+        and s.day_volume_usd >= min_volume_usd
+        # почти пустая лучшая цена: спред широкий, потому что никто не торгует
+        and s.top_depth_usd >= min_top_depth_usd
     ]
-    # Ожидаемый заработок ~ (спред − комиссии) × оборот; оборот — под корнем, чтобы не
-    # выбирать только самые ликвидные рынки с минимальным запасом по спреду.
+    # Оборот — под корнем, чтобы не выбирать только самые ликвидные рынки с минимальным edge.
     return sorted(good, key=lambda s: s.edge_bps * s.day_volume_usd.sqrt(), reverse=True)
 
 
 def score(s: MarketScan) -> float:
-    """Ожидаемый заработок ~ (спред − комиссии) × √оборот."""
+    """Ожидаемый заработок после комиссий и adverse selection × √оборот."""
     return float(s.edge_bps) * math.sqrt(float(s.day_volume_usd))
 
 
@@ -130,6 +139,7 @@ def choose_coins(
     min_leverage: int,
     exclude: tuple[str, ...] = (),
     hysteresis: float = 0.3,
+    min_top_depth_usd: Decimal = Decimal(0),
 ) -> tuple[list[str], list[MarketScan]]:
     """Монеты для маркет-мейкинга и ранжированные кандидаты.
 
@@ -144,6 +154,7 @@ def choose_coins(
             min_spread_bps=min_spread_bps,
             max_spread_bps=max_spread_bps,
             min_volume_usd=min_volume_usd,
+            min_top_depth_usd=min_top_depth_usd,
         )
         if s.max_leverage >= min_leverage and s.coin not in exclude
     ]

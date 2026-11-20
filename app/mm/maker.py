@@ -23,6 +23,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import logfire
@@ -53,6 +54,7 @@ from app.integrations.hyperliquid.ws import (
     subscribe_message,
 )
 from app.market_data.flow import BookSnapshot
+from app.mm.adverse import load_adverse_selection
 from app.mm.quoter import MIN_ORDER_USD, FlowWindow, Quote, QuoteDecision, decide
 from app.mm.scanner import MarketScan, choose_coins, scan, score
 from app.observability.notify import LogNotifier, Notifier
@@ -156,7 +158,16 @@ class MarketMaker:
         self._window = window
         self.coins = {c: CoinState(rules=r, flow=FlowWindow(window)) for c, r in rules.items()}
         self.known: set[str] = set(self.coins)  # все монеты этого запуска — для учёта исполнений
-        self.scanner: ScanFn = scanner or (lambda: scan(gateway, top=30, samples=4, pause_s=3))
+        self.scanner: ScanFn = scanner or (
+            lambda: scan(
+                gateway,
+                top=cfg.select_scan_top,
+                samples=4,
+                pause_s=3,
+                min_volume_usd=cfg.select_min_volume_usd,
+                adverse_selection=load_adverse_selection(Path(cfg.adverse_selection_path)),
+            )
+        )
         self.selection: dict[str, Any] = {}
         self._next_select_at: datetime | None = None
         self._resubscribe = False
@@ -261,6 +272,7 @@ class MarketMaker:
             min_leverage=self.cfg.leverage,
             exclude=self.cfg.exclude,
             hysteresis=self.cfg.select_hysteresis,
+            min_top_depth_usd=self.cfg.select_min_top_depth_usd,
         )
         for coin in target:
             await self.add_coin(coin)
@@ -278,6 +290,8 @@ class MarketMaker:
                     "coin": c.coin,
                     "spread_bps": round(float(c.spread_bps), 2),
                     "tick_bps": round(float(c.tick_bps), 2),
+                    "adverse_selection_bps": round(float(c.adverse_selection_bps), 2),
+                    "edge_bps": round(float(c.edge_bps), 2),
                     "volume_usd": float(c.day_volume_usd),
                     "score": round(score(c)),
                 }
@@ -682,7 +696,11 @@ class MarketMaker:
                     cancel.append(side)
             elif slot is None:
                 place.append((side, quote))
-            elif slot.price != quote.price:
+            elif quote.reduce_only and slot.size > quote.size:
+                modify.append((side, quote))  # заявка больше нужного (закрытие позиции) — сразу
+            elif abs(slot.price - quote.price) > max(
+                st.rules.tick(quote.price), quote.price * self.cfg.requote_slack_bps / 10_000
+            ):
                 # Отойти от рынка — сразу (иначе исполнят по устаревшей цене); подтянуться
                 # к лучшей цене — не чаще requote_min_interval_seconds.
                 retreat = quote.price < slot.price if side is Side.BUY else quote.price > slot.price

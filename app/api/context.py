@@ -1,16 +1,17 @@
 """Зависимости API: БД и уведомления.
 
-Ни ключа API-кошелька, ни запросов к бирже: панель читает состояние из БД (heartbeat и
-исполнения маркет-мейкера) и меняет только режим бота; заявки ставит маркет-мейкер.
+Состояние бота читается из heartbeat, актуальный счёт — read-only запросами к бирже.
+Торговые заявки ставит только отдельный процесс стратегии или явная команда оператора.
 """
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.jobs import JobRunner
 from app.config.settings import Settings
 from app.config.strategy import StrategyConfig, load_strategy
 from app.db.session import create_engine, create_sessionmaker
@@ -28,6 +29,7 @@ class ApiContext:
     strategy: StrategyConfig
     notifier: Notifier
     clock: Callable[[], datetime] = _utc_now
+    jobs: JobRunner = field(default_factory=JobRunner)
 
 
 @asynccontextmanager

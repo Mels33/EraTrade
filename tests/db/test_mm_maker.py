@@ -186,7 +186,12 @@ async def maker(
         ex,  # type: ignore[arg-type]
         ex,  # type: ignore[arg-type]
         committing_sessionmaker,
-        MmConfig(coins=(COIN,), requote_min_interval_seconds=3),
+        MmConfig(
+            coins=(COIN,),
+            requote_min_interval_seconds=3,
+            min_edge_bps=D(0),
+            inventory_skew_bps=D(0),
+        ),
         network=Network.MAINNET,
         user=USER,
         ws_url="ws://unused",
@@ -321,7 +326,13 @@ async def test_action_budget_limits_placements(
         ex,  # type: ignore[arg-type]
         ex,  # type: ignore[arg-type]
         committing_sessionmaker,
-        MmConfig(coins=(COIN,), max_actions_per_minute=3, requote_min_interval_seconds=0),
+        MmConfig(
+            coins=(COIN,),
+            max_actions_per_minute=3,
+            requote_min_interval_seconds=0,
+            min_edge_bps=D(0),
+            inventory_skew_bps=D(0),
+        ),
         network=Network.MAINNET,
         user=USER,
         ws_url="ws://unused",
@@ -365,7 +376,14 @@ def auto_maker(
         ex,  # type: ignore[arg-type]
         ex,  # type: ignore[arg-type]
         sm,
-        MmConfig(coins=(COIN,), auto_select=True, max_coins=1, requote_min_interval_seconds=0),
+        MmConfig(
+            coins=(COIN,),
+            auto_select=True,
+            max_coins=1,
+            requote_min_interval_seconds=0,
+            min_edge_bps=D(0),
+            inventory_skew_bps=D(0),
+        ),
         network=Network.MAINNET,
         user=USER,
         ws_url="ws://unused",
